@@ -397,7 +397,7 @@ impl Body {
             }
         }
         let reader = self.with_config().limit(MAX_BODY_SIZE).reader();
-        let value: T = serde_json::from_reader(reader)?;
+        let value: T = serde_json::from_reader(reader).map_err(json_error)?;
         Ok(value)
     }
 
@@ -498,6 +498,13 @@ impl<'a> BodyWithConfig<'a> {
     /// Controls how many bytes we should read before throwing an error. This is used
     /// to ensure RAM isn't exhausted by a server sending a very large response body.
     ///
+    /// The limit counts the bytes delivered to the caller, i.e. the output after
+    /// automatic decompression (gzip/brotli), charset conversion to UTF-8 and
+    /// lossy utf-8 replacement — not the compressed transfer size. A body that
+    /// is exactly `value` bytes long and then ends normally is not an error;
+    /// only a body with at least one more output byte fails with
+    /// [`Error::BodyExceedsLimit`].
+    ///
     /// The default limit is `u64::MAX` (unlimited).
     pub fn limit(mut self, value: u64) -> Self {
         self.limit = value;
@@ -518,7 +525,8 @@ impl<'a> BodyWithConfig<'a> {
 
     fn do_build(self) -> BodyReader<'a> {
         BodyReader::new(
-            LimitReader::new(self.handler, self.limit),
+            self.handler,
+            self.limit,
             &self.info,
             self.info.body_mode,
             self.lossy_utf8,
@@ -646,9 +654,27 @@ impl<'a> BodyWithConfig<'a> {
             }
         }
         let reader = self.do_build();
-        let value: T = serde_json::from_reader(reader)?;
+        let value: T = serde_json::from_reader(reader).map_err(json_error)?;
         Ok(value)
     }
+}
+
+/// Translate a serde_json streaming error back to the error it wraps.
+///
+/// When `read_json()` parses directly from the body reader, a read failure
+/// (such as [`Error::BodyExceedsLimit`], a timeout or a decompression
+/// failure) travels through serde_json as an io error. Unwrap it so the
+/// caller sees the original error rather than a JSON error. Genuine JSON
+/// syntax and type errors are returned as [`Error::Json`] as before.
+#[cfg(feature = "json")]
+fn json_error(e: serde_json::Error) -> Error {
+    if e.is_io() {
+        // From<io::Error> for Error unwraps any wrapped ureq error
+        // (BodyExceedsLimit, Timeout, Decompress, ...) and falls back
+        // to Error::Io for other io errors.
+        return Error::from(io::Error::from(e));
+    }
+    Error::Json(e)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -753,7 +779,11 @@ fn split_content_type(content_type: &str) -> (Option<String>, Option<String>) {
 /// 4. If `Content-Length` is set, the returned reader is limited to this byte
 ///    length regardless of how many bytes the server sends.
 /// 5. If no length header, the reader is until server stream end.
-/// 6. The limit in the body method used to obtain the reader.
+/// 6. The limit in the body method used to obtain the reader. The limit counts
+///    the output bytes after the decoding steps above (decompression, charset
+///    conversion, lossy utf-8 replacement). A body ending exactly at the limit
+///    is read successfully; one more output byte causes
+///    [`Error::BodyExceedsLimit`].
 ///
 /// Note: The reader is also limited by the [`Body::as_reader`] and
 /// [`Body::into_reader`] calls. If that limit is set very high, a malicious
@@ -780,7 +810,9 @@ fn split_content_type(content_type: &str) -> (Option<String>, Option<String>) {
 /// # Ok::<_, ureq::Error>(())
 /// ```
 pub struct BodyReader<'a> {
-    reader: MaybeLossyDecoder<CharsetDecoder<ContentDecoder<LimitReader<BodySourceRef<'a>>>>>,
+    // The limit is outermost, so it counts the final output bytes: after
+    // decompression, charset conversion and lossy utf-8 replacement.
+    reader: LimitReader<MaybeLossyDecoder<CharsetDecoder<ContentDecoder<BodySourceRef<'a>>>>>,
     // If this reader is used as SendBody for another request, this
     // body mode can indiciate the content-length. Gzip, charset etc
     // would mean input is not same as output.
@@ -789,7 +821,8 @@ pub struct BodyReader<'a> {
 
 impl<'a> BodyReader<'a> {
     fn new(
-        reader: LimitReader<BodySourceRef<'a>>,
+        reader: BodySourceRef<'a>,
+        limit: u64,
         info: &ResponseInfo,
         incoming_body_mode: BodyMode,
         lossy_utf8: bool,
@@ -834,6 +867,11 @@ impl<'a> BodyReader<'a> {
         } else {
             MaybeLossyDecoder::PassThrough(reader)
         };
+
+        // The size limit applies to the output bytes the caller receives,
+        // i.e. after decompression, charset conversion and lossy utf-8
+        // replacement. A body that ends exactly at the limit is not an error.
+        let reader = LimitReader::new(reader, limit);
 
         BodyReader {
             outgoing_body_mode,
@@ -1066,6 +1104,175 @@ mod test {
         let value: Value = body.with_config().limit(40).read_json().unwrap();
         assert_eq!(value["hello"], "world");
         assert_eq!(value["nums"][2], 3);
+    }
+
+    #[test]
+    #[cfg(feature = "json")]
+    fn read_json_exact_limit() {
+        use serde_json::Value;
+
+        // A JSON body of exactly the limit size parses successfully.
+        let json = br#"{"hello":"world"}"#;
+        let len = json.len().to_string();
+        set_handler(
+            "/json",
+            200,
+            &[("content-length", &len), ("content-type", "application/json")],
+            json,
+        );
+
+        let mut res = crate::get("https://my.test/json").call().unwrap();
+        let value: Value = res
+            .body_mut()
+            .with_config()
+            .limit(json.len() as u64)
+            .read_json()
+            .unwrap();
+        assert_eq!(value["hello"], "world");
+    }
+
+    #[test]
+    #[cfg(feature = "json")]
+    fn read_json_limit_exceeded_is_not_json_error() {
+        use serde_json::Value;
+
+        let json = br#"{"hello":"world","nums":[1,2,3]}"#;
+        let len = json.len().to_string();
+
+        // Known content-length (streamed parse, since the length is more
+        // than a third of the limit).
+        set_handler(
+            "/json_len",
+            200,
+            &[("content-length", &len), ("content-type", "application/json")],
+            json,
+        );
+        let mut res = crate::get("https://my.test/json_len").call().unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(5)
+            .read_json::<Value>()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::BodyExceedsLimit(5)),
+            "expected BodyExceedsLimit, got: {:?}",
+            err
+        );
+
+        // Chunked (unknown length).
+        let mut chunked = format!("{:x}\r\n", json.len());
+        chunked.push_str(std::str::from_utf8(json).unwrap());
+        chunked.push_str("\r\n0\r\n\r\n");
+        set_handler(
+            "/json_chunked",
+            200,
+            &[
+                ("transfer-encoding", "chunked"),
+                ("content-type", "application/json"),
+            ],
+            chunked.as_bytes(),
+        );
+        let mut res = crate::get("https://my.test/json_chunked").call().unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(5)
+            .read_json::<Value>()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::BodyExceedsLimit(5)),
+            "expected BodyExceedsLimit, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "json", feature = "gzip"))]
+    fn read_json_gzip_limit_exceeded_is_not_json_error() {
+        use serde_json::Value;
+
+        // A JSON body that compresses below the limit still exceeds it once
+        // decompressed, and the error must be BodyExceedsLimit, not Json.
+        let json = br#"{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":1}"#;
+        let compressed = {
+            use flate2::Compression;
+            use flate2::write::GzEncoder;
+            use std::io::Write;
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(json).unwrap();
+            encoder.finish().unwrap()
+        };
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/json_gz",
+            200,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-length", &compressed_len),
+                ("content-type", "application/json"),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/json_gz").call().unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(10)
+            .read_json::<Value>()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::BodyExceedsLimit(10)),
+            "expected BodyExceedsLimit, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "charset")]
+    fn limit_counts_utf8_output_bytes() {
+        init_test_log();
+
+        // ISO-8859-1 encoded "é" is 1 byte, but 2 bytes as UTF-8. The limit
+        // counts the converted output.
+        set_handler(
+            "/get",
+            200,
+            &[
+                ("content-type", "text/plain; charset=iso-8859-1"),
+                ("content-length", "1"),
+            ],
+            &[0xE9],
+        );
+
+        let mut res = crate::get("https://my.test/get").call().unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(1)
+            .read_to_string()
+            .unwrap_err();
+        assert!(matches!(err, Error::BodyExceedsLimit(1)));
+
+        set_handler(
+            "/get",
+            200,
+            &[
+                ("content-type", "text/plain; charset=iso-8859-1"),
+                ("content-length", "1"),
+            ],
+            &[0xE9],
+        );
+        let mut res = crate::get("https://my.test/get").call().unwrap();
+        let s = res
+            .body_mut()
+            .with_config()
+            .limit(2)
+            .read_to_string()
+            .unwrap();
+        assert_eq!(s, "é");
     }
 
     #[test]

@@ -62,7 +62,11 @@ pub enum Error {
     /// would be to rely on the `log` crate to provide additional information.
     ConnectionFailed,
 
-    /// A send body (Such as `&str`) is larger than the `content-length` header.
+    /// The response body is larger than the limit set via
+    /// [`BodyWithConfig::limit()`](crate::BodyWithConfig::limit).
+    ///
+    /// The limit counts the body bytes delivered to the caller, i.e. after
+    /// any automatic decompression and charset conversion.
     BodyExceedsLimit(u64),
 
     /// Too many redirects.

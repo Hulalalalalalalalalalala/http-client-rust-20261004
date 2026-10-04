@@ -397,8 +397,7 @@ impl Body {
             }
         }
         let reader = self.with_config().limit(MAX_BODY_SIZE).reader();
-        let value: T = serde_json::from_reader(reader)?;
-        Ok(value)
+        json_from_reader(reader)
     }
 
     /// Read the body data with configuration.
@@ -493,12 +492,27 @@ impl<'a> BodyWithConfig<'a> {
         }
     }
 
-    /// Limit the response body.
+    /// Limit the number of output bytes delivered from the response body.
     ///
-    /// Controls how many bytes we should read before throwing an error. This is used
-    /// to ensure RAM isn't exhausted by a server sending a very large response body.
+    /// The limit counts the bytes the caller actually *receives*: after
+    /// automatic decompression (`gzip`/`br`), after charset conversion to
+    /// utf-8, and after lossy utf-8 replacement. It does not count the
+    /// compressed on-wire size or the number of characters. A highly
+    /// compressed response can therefore exceed the limit even when its wire
+    /// size is small.
     ///
-    /// The default limit is `u64::MAX` (unlimited).
+    /// A body of exactly `value` bytes that ends normally is read in full.
+    /// [`Error::BodyExceedsLimit`] is returned only when an additional
+    /// (`value + 1`th) output byte exists. When streaming, at most `value`
+    /// bytes are ever delivered, and after the limit is reached subsequent
+    /// reads keep returning the error rather than ending cleanly.
+    ///
+    /// If decompression is not enabled for the response's `Content-Encoding`,
+    /// or the encoding is unrecognized, the body is passed through unchanged
+    /// and the limit still applies to those (final) output bytes.
+    ///
+    /// This is used to ensure RAM isn't exhausted by a server sending a very
+    /// large response body. The default limit is `u64::MAX` (unlimited).
     pub fn limit(mut self, value: u64) -> Self {
         self.limit = value;
         self
@@ -518,7 +532,8 @@ impl<'a> BodyWithConfig<'a> {
 
     fn do_build(self) -> BodyReader<'a> {
         BodyReader::new(
-            LimitReader::new(self.handler, self.limit),
+            self.handler,
+            self.limit,
             &self.info,
             self.info.body_mode,
             self.lossy_utf8,
@@ -646,8 +661,27 @@ impl<'a> BodyWithConfig<'a> {
             }
         }
         let reader = self.do_build();
-        let value: T = serde_json::from_reader(reader)?;
-        Ok(value)
+        json_from_reader(reader)
+    }
+}
+
+/// Parse JSON from a body reader.
+///
+/// When the underlying reader fails with an I/O error, such as
+/// [`Error::BodyExceedsLimit`], a decompression failure or a timeout, that
+/// error is returned unchanged instead of being wrapped in [`Error::Json`].
+/// Genuine JSON syntax and type errors are still reported as [`Error::Json`].
+#[cfg(feature = "json")]
+fn json_from_reader<T: serde::de::DeserializeOwned>(reader: BodyReader<'_>) -> Result<T, Error> {
+    match serde_json::from_reader(reader) {
+        Ok(value) => Ok(value),
+        Err(e) if e.is_io() => {
+            // serde_json stores the io::Error verbatim; converting back
+            // recovers the original wrapped ureq::Error (e.g.
+            // BodyExceedsLimit) via the From<io::Error> impl.
+            Err(Error::from(std::io::Error::from(e)))
+        }
+        Err(e) => Err(Error::Json(e)),
     }
 }
 
@@ -753,13 +787,15 @@ fn split_content_type(content_type: &str) -> (Option<String>, Option<String>) {
 /// 4. If `Content-Length` is set, the returned reader is limited to this byte
 ///    length regardless of how many bytes the server sends.
 /// 5. If no length header, the reader is until server stream end.
-/// 6. The limit in the body method used to obtain the reader.
+/// 6. The `limit()` configured on the body method, if any. It bounds the final
+///    output bytes delivered to the caller (after the decompression and
+///    charset steps above), not the compressed wire bytes.
 ///
-/// Note: The reader is also limited by the [`Body::as_reader`] and
-/// [`Body::into_reader`] calls. If that limit is set very high, a malicious
-/// server might return enough bytes to exhaust available memory. If you're
-/// making requests to untrusted servers, you should use set that
-/// limit accordingly.
+/// Note: Readers obtained via [`Body::as_reader`] and [`Body::into_reader`]
+/// are unlimited by default; a malicious server might return enough bytes to
+/// exhaust available memory. If you're making requests to untrusted servers,
+/// use [`Body::with_config`] / [`Body::into_with_config`] together with
+/// [`BodyWithConfig::limit`] to bound the output.
 ///
 /// # Example
 ///
@@ -780,7 +816,10 @@ fn split_content_type(content_type: &str) -> (Option<String>, Option<String>) {
 /// # Ok::<_, ureq::Error>(())
 /// ```
 pub struct BodyReader<'a> {
-    reader: MaybeLossyDecoder<CharsetDecoder<ContentDecoder<LimitReader<BodySourceRef<'a>>>>>,
+    // The limit is the outermost layer: it counts the final output bytes that
+    // the caller receives (after decompression, charset conversion to utf-8 and
+    // lossy replacement), not the compressed wire bytes.
+    reader: LimitReader<MaybeLossyDecoder<CharsetDecoder<ContentDecoder<BodySourceRef<'a>>>>>,
     // If this reader is used as SendBody for another request, this
     // body mode can indiciate the content-length. Gzip, charset etc
     // would mean input is not same as output.
@@ -789,7 +828,8 @@ pub struct BodyReader<'a> {
 
 impl<'a> BodyReader<'a> {
     fn new(
-        reader: LimitReader<BodySourceRef<'a>>,
+        reader: BodySourceRef<'a>,
+        limit: u64,
         info: &ResponseInfo,
         incoming_body_mode: BodyMode,
         lossy_utf8: bool,
@@ -834,6 +874,13 @@ impl<'a> BodyReader<'a> {
         } else {
             MaybeLossyDecoder::PassThrough(reader)
         };
+
+        // The limit is applied last, so it counts the bytes the caller actually
+        // receives: after decompression, charset conversion and lossy
+        // replacement. Every layer above the source streams into the caller's
+        // buffer with fixed-size internal buffers, so memory does not grow with
+        // bodies that exceed the limit.
+        let reader = LimitReader::new(reader, limit);
 
         BodyReader {
             outgoing_body_mode,
@@ -1080,5 +1127,283 @@ mod test {
 
         let err = crate::get("https://my.test/get").call().unwrap_err();
         assert!(matches!(err, Error::LargeResponseHeader(_, _)));
+    }
+
+    // A JSON body over the limit reports BodyExceedsLimit through the streaming
+    // parser path, not a JSON error.
+    #[test]
+    #[cfg(feature = "json")]
+    fn read_json_over_limit_is_body_error() {
+        use serde_json::Value;
+
+        init_test_log();
+        let json = br#"{"hello":"world","extra":"padding-to-exceed-limit"}"#;
+        let len = json.len().to_string();
+        set_handler(
+            "/json_over",
+            200,
+            &[
+                ("content-type", "application/json"),
+                ("content-length", &len),
+            ],
+            json,
+        );
+
+        let mut res = crate::get("https://my.test/json_over").call().unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(10)
+            .read_json::<Value>()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::BodyExceedsLimit(10)),
+            "expected BodyExceedsLimit, got {err:?}"
+        );
+    }
+
+    // A gzip-compressed JSON body over the decompressed limit also reports
+    // BodyExceedsLimit rather than a JSON error.
+    #[test]
+    #[cfg(all(feature = "json", feature = "gzip"))]
+    fn read_json_gzip_over_limit_is_body_error() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use serde_json::Value;
+        use std::io::Write;
+
+        init_test_log();
+        let json = br#"{"hello":"world","extra":"padding-to-exceed-limit"}"#;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(json).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let len = compressed.len().to_string();
+
+        set_handler(
+            "/json_gz_over",
+            200,
+            &[
+                ("content-type", "application/json"),
+                ("content-encoding", "gzip"),
+                ("content-length", &len),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/json_gz_over").call().unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(10)
+            .read_json::<Value>()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::BodyExceedsLimit(10)),
+            "expected BodyExceedsLimit, got {err:?}"
+        );
+    }
+
+    // Genuine JSON syntax errors remain Error::Json even with a limit set.
+    #[test]
+    #[cfg(feature = "json")]
+    fn read_json_syntax_error_stays_json_error() {
+        use serde_json::Value;
+
+        init_test_log();
+        let json = br#"{"hello": }"#;
+        let len = json.len().to_string();
+        set_handler(
+            "/json_bad",
+            200,
+            &[
+                ("content-type", "application/json"),
+                ("content-length", &len),
+            ],
+            json,
+        );
+
+        let mut res = crate::get("https://my.test/json_bad").call().unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(1_000_000)
+            .read_json::<Value>()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Json(_)),
+            "expected Json error, got {err:?}"
+        );
+    }
+
+    // Genuine JSON type errors remain Error::Json.
+    #[test]
+    #[cfg(feature = "json")]
+    fn read_json_type_error_stays_json_error() {
+        init_test_log();
+        let json = br#"42"#;
+        set_handler(
+            "/json_type",
+            200,
+            &[
+                ("content-type", "application/json"),
+                ("content-length", "2"),
+            ],
+            json,
+        );
+
+        let mut res = crate::get("https://my.test/json_type").call().unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(1_000_000)
+            .read_json::<String>()
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Json(_)),
+            "expected Json error, got {err:?}"
+        );
+    }
+
+    // The default convenience readers keep the 10MiB limit.
+    #[test]
+    fn default_vec_limit_is_ten_mib() {
+        use std::io;
+
+        // An endless reader reaches the default 10MiB without a huge fixture
+        // on disk.
+        let mut body = crate::Body::builder().reader(io::repeat(b'x'));
+        let err = body.read_to_vec().unwrap_err();
+        assert!(
+            matches!(err, Error::BodyExceedsLimit(n) if n == 10 * 1024 * 1024),
+            "got {err:?}"
+        );
+    }
+
+    // The limit counts the bytes emitted by charset conversion to utf-8, not
+    // the on-wire source bytes or the character count.
+    #[test]
+    #[cfg(feature = "charset")]
+    fn limit_counts_charset_converted_output() {
+        init_test_log();
+
+        // 0xA4 in ISO-8859-15 is U+20AC EURO SIGN, 3 bytes in utf-8.
+        // 4 source bytes -> 12 output bytes.
+        let body = [0xA4u8; 4];
+        set_handler(
+            "/cs_limit",
+            200,
+            &[("content-type", "text/plain; charset=iso-8859-15")],
+            &body,
+        );
+
+        // Exactly the 12 output bytes succeed.
+        let mut res = crate::get("https://my.test/cs_limit").call().unwrap();
+        let s = res
+            .body_mut()
+            .with_config()
+            .limit(12)
+            .read_to_string()
+            .unwrap();
+        assert_eq!(s, "\u{20AC}".repeat(4));
+        assert_eq!(s.len(), 12);
+
+        // One output byte less must fail, even though the wire body is only
+        // 4 bytes.
+        set_handler(
+            "/cs_limit",
+            200,
+            &[("content-type", "text/plain; charset=iso-8859-15")],
+            &body,
+        );
+        let mut res = crate::get("https://my.test/cs_limit").call().unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(11)
+            .read_to_string()
+            .unwrap_err();
+        assert!(matches!(err, Error::BodyExceedsLimit(11)), "got {err:?}");
+    }
+
+    // The limit has the same meaning over chunked transfer as over
+    // Content-Length.
+    #[test]
+    fn limit_chunked_exact_and_over() {
+        init_test_log();
+
+        let chunked = "5\r\nhello\r\n1\r\n!\r\n0\r\n\r\n";
+        set_handler(
+            "/chunked_limit",
+            200,
+            &[("transfer-encoding", "chunked")],
+            chunked.as_bytes(),
+        );
+
+        let mut res = crate::get("https://my.test/chunked_limit").call().unwrap();
+        let v = res.body_mut().with_config().limit(6).read_to_vec().unwrap();
+        assert_eq!(v, b"hello!");
+
+        set_handler(
+            "/chunked_limit",
+            200,
+            &[("transfer-encoding", "chunked")],
+            chunked.as_bytes(),
+        );
+        let mut res = crate::get("https://my.test/chunked_limit").call().unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(5)
+            .read_to_vec()
+            .unwrap_err();
+        assert!(matches!(err, Error::BodyExceedsLimit(5)));
+    }
+
+    // The limit has the same meaning for a close-delimited (HTTP/1.0) body.
+    #[test]
+    fn limit_close_delimited_exact_and_over() {
+        init_test_log();
+
+        crate::transport::set_handler_raw("/close_limit", move |w| {
+            write!(
+                w,
+                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nhello!<hangup>"
+            )
+        });
+
+        let mut res = crate::get("https://my.test/close_limit").call().unwrap();
+        let v = res.body_mut().with_config().limit(6).read_to_vec().unwrap();
+        assert_eq!(v, b"hello!");
+
+        crate::transport::set_handler_raw("/close_limit2", move |w| {
+            write!(
+                w,
+                "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nhello!<hangup>"
+            )
+        });
+        let mut res = crate::get("https://my.test/close_limit2").call().unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(5)
+            .read_to_vec()
+            .unwrap_err();
+        assert!(matches!(err, Error::BodyExceedsLimit(5)));
+    }
+
+    // An unrecognized content-encoding is passed through undecoded; the limit
+    // still applies to the (final, unchanged) output bytes.
+    #[test]
+    fn unknown_content_encoding_limit_applies_to_raw_bytes() {
+        init_test_log();
+        set_handler(
+            "/unknown_ce",
+            200,
+            &[("content-encoding", "deflate"), ("content-length", "5")],
+            b"hello",
+        );
+        let mut res = crate::get("https://my.test/unknown_ce").call().unwrap();
+        let v = res.body_mut().with_config().limit(5).read_to_vec().unwrap();
+        assert_eq!(v, b"hello");
     }
 }

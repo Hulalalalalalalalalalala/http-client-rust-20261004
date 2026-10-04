@@ -308,3 +308,48 @@ fn layered_read_uses_write_allowance_for_protocol_output() {
     assert_eq!(protocol_write.reason, Timeout::PerWrite);
     assert_eq!(*protocol_write.after, Duration::from_secs(7));
 }
+
+// After the reader has delivered exactly `limit` bytes, the remaining data only
+// settles whether the body ends or continues. If that final check times out
+// (or the transport errors), the timeout/transport error must be returned
+// rather than masked as BodyExceedsLimit.
+#[test]
+fn body_limit_boundary_probe_preserves_timeout() {
+    use std::io::Read;
+
+    const N: usize = 8;
+
+    let config = Agent::config_builder()
+        .proxy(None)
+        .timeout_per_read(Some(Duration::from_millis(10)))
+        .build();
+    let (agent, state) = setup(config);
+
+    // Header declares N+1 bytes; only N are ever sent before the read fails.
+    state.lock().unwrap().responses.extend([
+        b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n".as_slice(),
+        b"12345678",
+    ]);
+
+    let mut res = agent.get("http://127.0.0.1/").call().unwrap();
+    let mut reader = res.body_mut().with_config().limit(N as u64).reader();
+
+    // Receive the N permitted bytes.
+    let mut buf = [0u8; N];
+    let mut got = 0;
+    while got < N {
+        let n = reader.read(&mut buf[got..]).unwrap();
+        assert!(n > 0);
+        got += n;
+    }
+    assert_eq!(&buf, b"12345678");
+
+    // Now make the boundary probe time out.
+    state.lock().unwrap().fail_read = true;
+
+    let err = reader.read(&mut buf).unwrap_err();
+    match Error::from(err) {
+        Error::Timeout(Timeout::PerRead) => {}
+        other => panic!("expected PerRead timeout, got {other:?}"),
+    }
+}

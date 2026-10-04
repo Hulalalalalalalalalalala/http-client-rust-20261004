@@ -139,4 +139,203 @@ mod test {
         let body = res.body_mut().read_to_string().unwrap();
         assert_eq!(body, "{\"hello\":\"world\"}");
     }
+
+    // The limit counts decompressed output bytes, not the compressed wire size.
+    #[test]
+    fn gz_limit_counts_decompressed_bytes() {
+        init_test_log();
+
+        let original = vec![b'a'; 5000];
+        let compressed = gzip_compress(&original);
+        assert!(compressed.len() < original.len());
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_limit",
+            200,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        // A limit larger than the compressed body but smaller than the
+        // decompressed body must still be exceeded.
+        let mut res = crate::get("https://my.test/gz_limit").call().unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(1000)
+            .read_to_vec()
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::BodyExceedsLimit(1000)));
+    }
+
+    // Exactly N decompressed bytes ending cleanly reads in full; N+1 fails.
+    #[test]
+    fn gz_limit_exact_size_and_plus_one() {
+        init_test_log();
+
+        let original = vec![b'b'; 1000];
+        let compressed = gzip_compress(&original);
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_exact",
+            200,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_exact").call().unwrap();
+        let body = res
+            .body_mut()
+            .with_config()
+            .limit(1000)
+            .read_to_vec()
+            .unwrap();
+        assert_eq!(body.len(), 1000);
+
+        // Re-register the handler for the second request.
+        set_handler(
+            "/gz_exact",
+            200,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+        let mut res = crate::get("https://my.test/gz_exact").call().unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(999)
+            .read_to_vec()
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::BodyExceedsLimit(999)));
+    }
+
+    // Streaming a gzip body delivers at most N bytes and reports the limit
+    // without buffering the whole (potentially huge) decompressed body.
+    #[test]
+    fn gz_limit_streaming_delivery_capped() {
+        use std::io::Read;
+
+        init_test_log();
+
+        let original = vec![b'c'; 10_000];
+        let compressed = gzip_compress(&original);
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_stream",
+            200,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_stream").call().unwrap();
+        let mut reader = res.body_mut().with_config().limit(137).reader();
+
+        let mut total = 0usize;
+        let mut buf = [0u8; 16];
+        let err = loop {
+            match reader.read(&mut buf) {
+                Ok(0) => panic!("unexpected clean end for body over the limit"),
+                Ok(n) => {
+                    total += n;
+                    assert!(total <= 137, "delivered {total} bytes, limit is 137");
+                }
+                Err(e) => break crate::Error::from(e),
+            }
+        };
+        assert_eq!(total, 137);
+        assert!(matches!(err, crate::Error::BodyExceedsLimit(137)));
+    }
+
+    // After exactly N decompressed bytes, the remaining compressed data only
+    // confirms the end of the body. If the gzip checksum is corrupt there, the
+    // decompression error must surface rather than being masked by a limit
+    // error (or reported as success).
+    #[test]
+    fn gz_limit_corrupt_trailer_after_exact_limit_is_decompress_error() {
+        init_test_log();
+
+        let original = vec![b'd'; 1000];
+        let mut compressed = gzip_compress(&original);
+
+        // Corrupt the CRC32 field (4 bytes immediately before the 4-byte ISIZE).
+        let crc_start = compressed.len() - 8;
+        for b in &mut compressed[crc_start..crc_start + 4] {
+            *b ^= 0xFF;
+        }
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_corrupt_trailer",
+            200,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_corrupt_trailer")
+            .call()
+            .unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(1000)
+            .read_to_vec()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Decompress("gzip", _)),
+            "expected gzip Decompress error, got {err:?}"
+        );
+    }
+
+    // A truncated gzip stream right at the output limit is a decompression
+    // error, not BodyExceedsLimit and not success.
+    #[test]
+    fn gz_limit_truncated_stream_after_exact_limit_is_error() {
+        init_test_log();
+
+        let original = vec![b'e'; 1000];
+        let compressed = gzip_compress(&original);
+        // Drop the trailer and part of the deflate tail.
+        let truncated = compressed[..compressed.len() - 12].to_vec();
+        let truncated_len = truncated.len().to_string();
+
+        set_handler(
+            "/gz_truncated",
+            200,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-length", &truncated_len),
+            ],
+            &truncated,
+        );
+
+        let mut res = crate::get("https://my.test/gz_truncated").call().unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(1000)
+            .read_to_vec()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Decompress("gzip", _)),
+            "expected gzip Decompress error, got {err:?}"
+        );
+    }
 }

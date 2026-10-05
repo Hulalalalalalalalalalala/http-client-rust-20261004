@@ -74,10 +74,10 @@ impl<'a> SendBody<'a> {
                 return Ok(0);
             }
             BodyInner::ByteSlice(v) => {
-                let max = v.len().min(buf.len());
+                let max = v.remaining.len().min(buf.len());
 
-                buf[..max].copy_from_slice(&v[..max]);
-                *v = &v[max..];
+                buf[..max].copy_from_slice(&v.remaining[..max]);
+                v.remaining = &v.remaining[max..];
 
                 Ok(max)
             }
@@ -166,7 +166,7 @@ impl<'a> SendBody<'a> {
     #[cfg(feature = "multipart")]
     pub(crate) fn from_bytes<'b>(bytes: &'b [u8]) -> SendBody<'b> {
         SendBody {
-            inner: BodyInner::ByteSlice(bytes),
+            inner: BodyInner::ByteSlice(ByteSlice::new(bytes)),
             size: Some(Ok(bytes.len() as u64)),
             ended: false,
             content_type: None,
@@ -190,6 +190,34 @@ impl<'a> SendBody<'a> {
             ended: false,
             content_type: None,
         }
+    }
+
+    /// Whether this body can be replayed from the start.
+    ///
+    /// Only bodies held entirely in memory can be replayed. Bodies backed by
+    /// [`Read`] (files, network streams, etc) are consumed as they are sent
+    /// and cannot be resent.
+    pub(crate) fn is_replayable(&self) -> bool {
+        match &self.inner {
+            BodyInner::None => true,
+            BodyInner::ByteSlice(_) => true,
+            #[cfg(feature = "json")]
+            BodyInner::ByteVec(_) => true,
+            BodyInner::Reader(_) | BodyInner::OwnedReader(_) | BodyInner::Body(_) => false,
+        }
+    }
+
+    /// Rewind a replayable body to the start.
+    ///
+    /// Must only be called when [`SendBody::is_replayable`] is true.
+    pub(crate) fn rewind(&mut self) {
+        match &mut self.inner {
+            BodyInner::ByteSlice(v) => v.remaining = v.original,
+            #[cfg(feature = "json")]
+            BodyInner::ByteVec(v) => v.set_position(0),
+            _ => {}
+        }
+        self.ended = false;
     }
 }
 
@@ -265,9 +293,9 @@ impl<'a> AsSendBody for SendBody<'a> {
         SendBody {
             inner: match &mut self.inner {
                 BodyInner::None => BodyInner::None,
-                BodyInner::ByteSlice(v) => BodyInner::ByteSlice(v),
+                BodyInner::ByteSlice(v) => BodyInner::ByteSlice(*v),
                 #[cfg(feature = "json")]
-                BodyInner::ByteVec(v) => BodyInner::ByteSlice(v.get_ref()),
+                BodyInner::ByteVec(v) => BodyInner::ByteSlice(ByteSlice::new(v.get_ref())),
                 BodyInner::Reader(v) => BodyInner::Reader(v),
                 BodyInner::Body(v) => BodyInner::Reader(v),
                 BodyInner::OwnedReader(v) => BodyInner::Reader(v),
@@ -281,7 +309,7 @@ impl<'a> AsSendBody for SendBody<'a> {
 
 pub(crate) enum BodyInner<'a> {
     None,
-    ByteSlice(&'a [u8]),
+    ByteSlice(ByteSlice<'a>),
     #[cfg(feature = "json")]
     ByteVec(io::Cursor<Vec<u8>>),
     Body(Box<BodyReader<'a>>),
@@ -289,10 +317,26 @@ pub(crate) enum BodyInner<'a> {
     OwnedReader(Box<dyn Read>),
 }
 
+/// An in-memory byte slice body that can be replayed from the start.
+#[derive(Clone, Copy)]
+pub(crate) struct ByteSlice<'a> {
+    original: &'a [u8],
+    remaining: &'a [u8],
+}
+
+impl<'a> ByteSlice<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        ByteSlice {
+            original: bytes,
+            remaining: bytes,
+        }
+    }
+}
+
 impl Private for &[u8] {}
 impl AsSendBody for &[u8] {
     fn as_body(&mut self) -> SendBody {
-        let inner = BodyInner::ByteSlice(self);
+        let inner = BodyInner::ByteSlice(ByteSlice::new(self));
         (Some(self.len() as u64), inner).into()
     }
 }
@@ -300,7 +344,7 @@ impl AsSendBody for &[u8] {
 impl Private for &str {}
 impl AsSendBody for &str {
     fn as_body(&mut self) -> SendBody {
-        let inner = BodyInner::ByteSlice((*self).as_ref());
+        let inner = BodyInner::ByteSlice(ByteSlice::new((*self).as_ref()));
         (Some(self.len() as u64), inner).into()
     }
 }
@@ -308,7 +352,7 @@ impl AsSendBody for &str {
 impl Private for String {}
 impl AsSendBody for String {
     fn as_body(&mut self) -> SendBody {
-        let inner = BodyInner::ByteSlice((*self).as_ref());
+        let inner = BodyInner::ByteSlice(ByteSlice::new((*self).as_ref()));
         (Some(self.len() as u64), inner).into()
     }
 }
@@ -316,7 +360,7 @@ impl AsSendBody for String {
 impl Private for Vec<u8> {}
 impl AsSendBody for Vec<u8> {
     fn as_body(&mut self) -> SendBody {
-        let inner = BodyInner::ByteSlice((*self).as_ref());
+        let inner = BodyInner::ByteSlice(ByteSlice::new((*self).as_ref()));
         (Some(self.len() as u64), inner).into()
     }
 }
@@ -324,7 +368,7 @@ impl AsSendBody for Vec<u8> {
 impl Private for &String {}
 impl AsSendBody for &String {
     fn as_body(&mut self) -> SendBody {
-        let inner = BodyInner::ByteSlice((*self).as_ref());
+        let inner = BodyInner::ByteSlice(ByteSlice::new((*self).as_ref()));
         (Some(self.len() as u64), inner).into()
     }
 }
@@ -332,7 +376,7 @@ impl AsSendBody for &String {
 impl Private for &Vec<u8> {}
 impl AsSendBody for &Vec<u8> {
     fn as_body(&mut self) -> SendBody {
-        let inner = BodyInner::ByteSlice((*self).as_ref());
+        let inner = BodyInner::ByteSlice(ByteSlice::new((*self).as_ref()));
         (Some(self.len() as u64), inner).into()
     }
 }
@@ -433,7 +477,7 @@ impl AsSendBody for Response<Body> {
 impl<const N: usize> Private for &[u8; N] {}
 impl<const N: usize> AsSendBody for &[u8; N] {
     fn as_body(&mut self) -> SendBody {
-        let inner = BodyInner::ByteSlice((*self).as_ref());
+        let inner = BodyInner::ByteSlice(ByteSlice::new((*self).as_ref()));
         (Some(self.len() as u64), inner).into()
     }
 }

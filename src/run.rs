@@ -2,7 +2,7 @@ use std::sync::{Arc, LazyLock};
 use std::{io, mem};
 
 use http::uri::Scheme;
-use http::{HeaderValue, Method, Request, Response, Uri, header};
+use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, header};
 use ureq_proto::BodyMode;
 use ureq_proto::client::state::{Await100, RecvBody, RecvResponse, Redirect, SendRequest};
 use ureq_proto::client::state::{Prepare, SendBody as SendBodyState};
@@ -10,7 +10,7 @@ use ureq_proto::client::{Await100Result, RecvBodyResult};
 use ureq_proto::client::{RecvResponseResult, SendRequestResult};
 
 use crate::body::ResponseInfo;
-use crate::config::{Config, DEFAULT_USER_AGENT, RequestLevelConfig};
+use crate::config::{Config, DEFAULT_USER_AGENT, RedirectAuthHeaders, RequestLevelConfig};
 use crate::http;
 use crate::pool::Connection;
 use crate::request::ForceSendBody;
@@ -18,7 +18,9 @@ use crate::response::{RedirectHistory, ResponseUri};
 use crate::timings::{CallTimings, CurrentTime};
 use crate::transport::ConnectionDetails;
 use crate::transport::time::{Duration, Instant};
-use crate::util::{DebugRequest, DebugResponse, DebugUri, HeaderMapExt, UriExt};
+use crate::util::{
+    DebugRequest, DebugResponse, DebugUri, HeaderMapExt, UriExt, new_uri_from_location,
+};
 use crate::{Agent, Body, Error, SendBody, Timeout};
 
 type Call<T> = ureq_proto::client::Call<T>;
@@ -49,6 +51,13 @@ pub(crate) fn run(
 
     let mut timings = CallTimings::new(timeouts, CurrentTime::default()).with_io_timeouts(&config);
 
+    // A template of the request currently being sent. This is used to
+    // rebuild the request when a 307/308 redirect requires the body to
+    // be replayed. The template only ever holds headers from the original
+    // request; headers ureq adds automatically (such as Content-Length)
+    // are amended on the call and recomputed for each redirect hop.
+    let mut template = request_template(&request);
+
     let mut call = Call::new(request)?;
 
     if force_send_body {
@@ -78,18 +87,54 @@ pub(crate) fn run(
             &mut timings,
         )? {
             // Follow redirect
-            CallResult::Redirect(rcall, rtimings) => {
+            CallResult::Redirect(rcall, rtimings, location) => {
                 redirect_count += 1;
 
-                call = handle_redirect(rcall, &config)?;
+                let status = rcall.status();
+                let is_retain_status = matches!(
+                    status,
+                    StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+                );
+                let method_needs_body = matches!(
+                    template.method(),
+                    &Method::POST | &Method::PUT | &Method::PATCH
+                );
 
-                // If the new method doesn't need a body, clear it.
-                // This prevents Content-Length/Transfer-Encoding headers from being added
-                // on methods like GET that don't send bodies (e.g., POST->GET redirects).
-                let method = call.method();
-                if !matches!(method, &Method::POST | &Method::PUT | &Method::PATCH) {
-                    body.remove();
-                }
+                call = if is_retain_status && method_needs_body {
+                    // A 307/308 redirect on POST/PUT/PATCH must resend the
+                    // request body. This is only possible for bodies held
+                    // in memory, and only when the caller opted in.
+                    if !config.redirect_body_replay() || !body.is_replayable() {
+                        return Err(Error::RedirectFailed);
+                    }
+
+                    body.rewind();
+
+                    let request = redirect_replay_request(&template, location.as_ref(), &config)?;
+
+                    debug!(
+                        "Redirect ({}): {} {:?}",
+                        status,
+                        request.method(),
+                        DebugUri(request.uri())
+                    );
+
+                    Call::new(request)?
+                } else {
+                    let call = handle_redirect(rcall, &config)?;
+
+                    // If the new method doesn't need a body, clear it.
+                    // This prevents Content-Length/Transfer-Encoding headers from being added
+                    // on methods like GET that don't send bodies (e.g., POST->GET redirects).
+                    let method = call.method();
+                    if !matches!(method, &Method::POST | &Method::PUT | &Method::PATCH) {
+                        body.remove();
+                    }
+
+                    call
+                };
+
+                template = request_template_from_call(&call);
 
                 timings = rtimings.new_call();
             }
@@ -223,9 +268,10 @@ fn call_run(
 
             if response.status().is_redirection() {
                 if is_following_redirects {
+                    let location = response.headers().get(header::LOCATION).cloned();
                     let call = handler.consume_redirect_body()?;
 
-                    CallResult::Redirect(call, handler.timings)
+                    CallResult::Redirect(call, handler.timings, location)
                 } else if config.max_redirects_do_error() {
                     return Err(Error::TooManyRedirects);
                 } else {
@@ -239,7 +285,8 @@ fn call_run(
             cleanup(connection, call.must_close_connection(), timings.now());
 
             if is_following_redirects {
-                CallResult::Redirect(call, mem::take(timings))
+                let location = response.headers().get(header::LOCATION).cloned();
+                CallResult::Redirect(call, mem::take(timings), location)
             } else if config.max_redirects_do_error() {
                 return Err(Error::TooManyRedirects);
             } else {
@@ -259,7 +306,7 @@ fn call_run(
 #[allow(clippy::large_enum_variant)]
 enum CallResult {
     /// Call resulted in a redirect.
-    Redirect(Call<Redirect>, CallTimings),
+    Redirect(Call<Redirect>, CallTimings, Option<HeaderValue>),
 
     /// Call resulted in a response.
     Response(Response<()>, BodyHandler),
@@ -610,6 +657,75 @@ fn handle_redirect(mut call: Call<Redirect>, config: &Config) -> Result<Call<Pre
     } else {
         Err(Error::RedirectFailed)
     }
+}
+
+/// A snapshot of a request, used to rebuild it when a 307/308 redirect
+/// requires the body to be replayed.
+///
+/// Extensions are not carried over. They are either consumed when setting
+/// up the call (such as [`RequestLevelConfig`]) or not relevant for a
+/// redirected request.
+fn request_template(request: &Request<()>) -> Request<()> {
+    let mut template = Request::new(());
+    *template.method_mut() = request.method().clone();
+    *template.uri_mut() = request.uri().clone();
+    *template.version_mut() = request.version();
+    *template.headers_mut() = request.headers().clone();
+    template
+}
+
+fn request_template_from_call(call: &Call<Prepare>) -> Request<()> {
+    let mut template = Request::new(());
+    *template.method_mut() = call.method().clone();
+    *template.uri_mut() = call.uri().clone();
+    *template.version_mut() = call.version();
+    *template.headers_mut() = call.headers().clone();
+    template
+}
+
+/// Build the request for a 307/308 redirect that replays the request body.
+///
+/// The method and headers are retained from the previous request. This
+/// mirrors the header handling in ureq-proto's redirect logic, except that
+/// a caller-provided `Content-Length`/`Transfer-Encoding` is kept, since the
+/// replayed body is byte-identical to what was first sent.
+fn redirect_replay_request(
+    template: &Request<()>,
+    location: Option<&HeaderValue>,
+    config: &Config,
+) -> Result<Request<()>, Error> {
+    let header = location.ok_or(ureq_proto::Error::NoLocationHeader)?;
+
+    let location = header.to_str().map_err(|_| {
+        ureq_proto::Error::BadLocationHeader(String::from_utf8_lossy(header.as_bytes()).to_string())
+    })?;
+
+    let uri = new_uri_from_location(template.uri(), location)?;
+
+    let keep_auth_header = match config.redirect_auth_headers() {
+        RedirectAuthHeaders::SameHost => can_redirect_auth_header(template.uri(), &uri),
+        _ => false,
+    };
+
+    let mut request = request_template(template);
+    *request.uri_mut() = uri;
+
+    // Mutate the request to remove headers we cannot keep in the redirect.
+    let headers = request.headers_mut();
+    if !keep_auth_header {
+        headers.remove(header::AUTHORIZATION);
+    }
+    headers.remove(header::COOKIE);
+
+    Ok(request)
+}
+
+fn can_redirect_auth_header(prev: &Uri, next: &Uri) -> bool {
+    let host_prev = prev.authority().map(|a| a.host());
+    let host_next = next.authority().map(|a| a.host());
+    let scheme_prev = prev.scheme();
+    let scheme_next = next.scheme();
+    host_prev == host_next && (scheme_prev == scheme_next || scheme_next == Some(&Scheme::HTTPS))
 }
 
 fn cleanup(connection: Connection, must_close: bool, now: Instant) {

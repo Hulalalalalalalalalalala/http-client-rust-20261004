@@ -5,7 +5,7 @@ use std::{fmt, iter};
 use http::header::{ACCEPT, ACCEPT_CHARSET, ACCEPT_ENCODING};
 use http::header::{CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
 use http::header::{DATE, HOST, LOCATION, SERVER, TRANSFER_ENCODING, USER_AGENT};
-use http::uri::{Authority, Scheme};
+use http::uri::{Authority, PathAndQuery, Scheme};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Response, Uri, Version};
 
 use crate::Error;
@@ -357,6 +357,113 @@ impl UriExt for Uri {
                 .unwrap_or(self.scheme().unwrap().default_port().unwrap_or(80)),
         )
     }
+}
+
+/// Resolve a `Location` header value against the URI of the request that
+/// received the redirect. Handles absolute URIs, network-path references
+/// (`//host/path`), root-relative and relative locations.
+///
+/// This mirrors the redirect URI handling in ureq-proto.
+pub(crate) fn new_uri_from_location(base: &Uri, location: &str) -> Result<Uri, Error> {
+    join_location(base.clone(), location).map_err(Error::from)
+}
+
+fn join_location(base: Uri, location: &str) -> Result<Uri, ureq_proto::Error> {
+    let mut parts = base.into_parts();
+
+    let maybe = location.parse::<Uri>();
+    let has_scheme = maybe
+        .as_ref()
+        .ok()
+        .map(|u| u.scheme().is_some())
+        .unwrap_or(false);
+
+    if has_scheme {
+        // Location is a complete Uri.
+        // unwrap is ok beause has_scheme cannot be true if parsing failed.
+        return Ok(maybe.unwrap());
+    }
+
+    if location.starts_with("//") {
+        // Location is a network-path reference, i.e. it holds its own
+        // authority and we only inherit the scheme of the base uri.
+        // https://datatracker.ietf.org/doc/html/rfc3986#section-4.2
+        let scheme = parts
+            .scheme
+            .as_ref()
+            .ok_or_else(|| ureq_proto::Error::BadLocationHeader(location.to_string()))?;
+
+        let joined: Uri = format!("{}:{}", scheme.as_str(), location)
+            .parse()
+            .map_err(|_| ureq_proto::Error::BadLocationHeader(location.to_string()))?;
+
+        return Ok(joined);
+    }
+
+    if location.starts_with("/") {
+        // Location is root-relative, i.e. we keep the
+        // authority of the base uri but replace the path
+
+        let pq: PathAndQuery = location
+            .parse()
+            .map_err(|_| ureq_proto::Error::BadLocationHeader(location.to_string()))?;
+
+        parts.path_and_query = Some(pq);
+    } else {
+        // Location is relative, i.e. y/foo.html, ../ or ./ which means
+        // we should interpret it against the base uri path.
+        let base_path = parts
+            .path_and_query
+            .as_ref()
+            .map(|p| p.path())
+            .unwrap_or("/");
+
+        let total_path = join_relative(base_path, location)?;
+
+        let pq: PathAndQuery = total_path
+            .parse()
+            .map_err(|_| ureq_proto::Error::BadLocationHeader(location.to_string()))?;
+
+        parts.path_and_query = Some(pq);
+    }
+
+    let uri = Uri::from_parts(parts)
+        .map_err(|_| ureq_proto::Error::BadLocationHeader(location.to_string()))?;
+
+    Ok(uri)
+}
+
+fn join_relative(base_path: &str, location: &str) -> Result<String, ureq_proto::Error> {
+    // base_path should be at least "/".
+    assert!(!base_path.is_empty());
+    // we should not attempt to join relative if location starts with "/"
+    assert!(!location.starts_with("/"));
+
+    let mut joiner: Vec<&str> = base_path.split('/').collect();
+
+    // "" => [""]
+    // "/" => ["", ""]
+    // "/foo" => ["", "foo"]
+    // "/foo/" => ["", "foo", ""]
+    if joiner.len() > 1 {
+        joiner.pop();
+    }
+
+    for segment in location.split('/') {
+        if segment == "." {
+            // do nothing
+        } else if segment == ".." {
+            if joiner.len() == 1 {
+                trace!("Location is relative above root");
+                return Err(ureq_proto::Error::BadLocationHeader(location.to_string()));
+            }
+            joiner.pop();
+        } else {
+            joiner.push(segment);
+        }
+    }
+
+    Ok(joiner.join("/"))
 }
 
 pub(crate) trait HeaderMapExt {

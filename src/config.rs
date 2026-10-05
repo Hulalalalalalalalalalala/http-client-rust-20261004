@@ -164,6 +164,7 @@ pub struct Config {
     max_redirects: u32,
     max_redirects_will_error: bool,
     redirect_auth_headers: RedirectAuthHeaders,
+    redirect_body_replay: bool,
     save_redirect_history: bool,
     user_agent: AutoHeaderValue,
     accept: AutoHeaderValue,
@@ -205,6 +206,7 @@ impl Config {
             max_redirects: _,
             max_redirects_will_error: _,
             redirect_auth_headers: _,
+            redirect_body_replay: _,
             save_redirect_history: _,
             accept: _,
             accept_encoding: _,
@@ -351,6 +353,25 @@ impl Config {
     /// Defaults to `None`.
     pub fn redirect_auth_headers(&self) -> RedirectAuthHeaders {
         self.redirect_auth_headers
+    }
+
+    /// Whether to replay the request body when following a 307 or 308 redirect.
+    ///
+    /// By default, ureq refuses to follow a 307/308 redirect for methods with
+    /// a request body (POST, PUT, PATCH) and fails with
+    /// [`crate::Error::RedirectFailed`], since a body
+    /// that has been sent cannot generally be produced again.
+    ///
+    /// When this is enabled, bodies held in memory (such as `&str`, `&[u8]`,
+    /// `String`, `Vec<u8>` and bodies sent via the JSON or form helpers) are
+    /// resent in full, with the original method, for every redirect hop.
+    /// Bodies backed by a [`std::io::Read`] (files, network streams, etc)
+    /// cannot be replayed and still result in
+    /// [`crate::Error::RedirectFailed`].
+    ///
+    /// Defaults to `false`.
+    pub fn redirect_body_replay(&self) -> bool {
+        self.redirect_body_replay
     }
 
     /// If we should record a history of every redirect location,
@@ -603,6 +624,26 @@ impl<Scope: private::ConfigScope> ConfigBuilder<Scope> {
     /// Defaults to `None`.
     pub fn redirect_auth_headers(mut self, v: RedirectAuthHeaders) -> Self {
         self.config().redirect_auth_headers = v;
+        self
+    }
+
+    /// Whether to replay the request body when following a 307 or 308 redirect.
+    ///
+    /// By default, ureq refuses to follow a 307/308 redirect for methods with
+    /// a request body (POST, PUT, PATCH) and fails with
+    /// [`crate::Error::RedirectFailed`], since a body
+    /// that has been sent cannot generally be produced again.
+    ///
+    /// When this is enabled, bodies held in memory (such as `&str`, `&[u8]`,
+    /// `String`, `Vec<u8>` and bodies sent via the JSON or form helpers) are
+    /// resent in full, with the original method, for every redirect hop.
+    /// Bodies backed by a [`std::io::Read`] (files, network streams, etc)
+    /// cannot be replayed and still result in
+    /// [`crate::Error::RedirectFailed`].
+    ///
+    /// Defaults to `false`.
+    pub fn redirect_body_replay(mut self, v: bool) -> Self {
+        self.config().redirect_body_replay = v;
         self
     }
 
@@ -1015,6 +1056,7 @@ impl Default for Config {
             max_redirects: 10,
             max_redirects_will_error: true,
             redirect_auth_headers: RedirectAuthHeaders::Never,
+            redirect_body_replay: false,
             save_redirect_history: false,
             user_agent: AutoHeaderValue::default(),
             accept: AutoHeaderValue::default(),
@@ -1093,6 +1135,7 @@ impl fmt::Debug for Config {
             .field("no_delay", &self.no_delay)
             .field("max_redirects", &self.max_redirects)
             .field("redirect_auth_headers", &self.redirect_auth_headers)
+            .field("redirect_body_replay", &self.redirect_body_replay)
             .field("save_redirect_history", &self.save_redirect_history)
             .field("user_agent", &self.user_agent)
             .field("timeouts", &self.timeouts)

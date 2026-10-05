@@ -1493,3 +1493,6 @@ pub(crate) mod test {
 
 #[cfg(test)]
 mod io_timeout_tests;
+
+#[cfg(all(test, feature = "_test"))]
+mod redirect_replay_tests;

@@ -42,7 +42,9 @@ pub enum Error {
     ///
     /// This happens when ureq encounters a redirect when sending a request body
     /// such as a POST request, and receives a 307/308 response. ureq refuses to
-    /// redirect the POST body and instead raises this error.
+    /// redirect the POST body and instead raises this error, unless the body is
+    /// held in memory and body replay has been enabled via
+    /// [`redirect_body_replay()`](crate::config::ConfigBuilder::redirect_body_replay).
     RedirectFailed,
 
     /// Error when creating proxy settings.

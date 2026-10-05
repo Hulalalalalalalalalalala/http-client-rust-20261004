@@ -164,6 +164,7 @@ pub struct Config {
     max_redirects: u32,
     max_redirects_will_error: bool,
     redirect_auth_headers: RedirectAuthHeaders,
+    redirect_body_replay: bool,
     save_redirect_history: bool,
     user_agent: AutoHeaderValue,
     accept: AutoHeaderValue,
@@ -205,6 +206,7 @@ impl Config {
             max_redirects: _,
             max_redirects_will_error: _,
             redirect_auth_headers: _,
+            redirect_body_replay: _,
             save_redirect_history: _,
             accept: _,
             accept_encoding: _,
@@ -351,6 +353,15 @@ impl Config {
     /// Defaults to `None`.
     pub fn redirect_auth_headers(&self) -> RedirectAuthHeaders {
         self.redirect_auth_headers
+    }
+
+    /// Whether to replay the request body when following 307/308 redirects.
+    ///
+    /// See [`ConfigBuilder::redirect_body_replay()`] for details.
+    ///
+    /// Defaults to `false`.
+    pub fn redirect_body_replay(&self) -> bool {
+        self.redirect_body_replay
     }
 
     /// If we should record a history of every redirect location,
@@ -603,6 +614,28 @@ impl<Scope: private::ConfigScope> ConfigBuilder<Scope> {
     /// Defaults to `None`.
     pub fn redirect_auth_headers(mut self, v: RedirectAuthHeaders) -> Self {
         self.config().redirect_auth_headers = v;
+        self
+    }
+
+    /// Whether to replay the request body when following 307/308 redirects.
+    ///
+    /// By default, ureq refuses to follow a 307 (Temporary Redirect) or 308
+    /// (Permanent Redirect) response to a request with a body (POST, PUT or
+    /// PATCH) and fails with [`Error::RedirectFailed`],
+    /// since a body can generally not be sent twice.
+    ///
+    /// When enabled, a body held in memory (such as `&str`, `String`, `&[u8]`,
+    /// `Vec<u8>`, including the JSON and form helpers) is resent in full to the
+    /// redirect target, keeping the original method and content type. Bodies
+    /// that cannot be replayed, such as files, streams, generic readers and
+    /// response bodies, still fail with `Error::RedirectFailed` without the
+    /// redirect target receiving anything.
+    ///
+    /// This can be set on the agent level and overridden per request.
+    ///
+    /// Defaults to `false`.
+    pub fn redirect_body_replay(mut self, v: bool) -> Self {
+        self.config().redirect_body_replay = v;
         self
     }
 
@@ -1015,6 +1048,7 @@ impl Default for Config {
             max_redirects: 10,
             max_redirects_will_error: true,
             redirect_auth_headers: RedirectAuthHeaders::Never,
+            redirect_body_replay: false,
             save_redirect_history: false,
             user_agent: AutoHeaderValue::default(),
             accept: AutoHeaderValue::default(),
@@ -1093,6 +1127,7 @@ impl fmt::Debug for Config {
             .field("no_delay", &self.no_delay)
             .field("max_redirects", &self.max_redirects)
             .field("redirect_auth_headers", &self.redirect_auth_headers)
+            .field("redirect_body_replay", &self.redirect_body_replay)
             .field("save_redirect_history", &self.save_redirect_history)
             .field("user_agent", &self.user_agent)
             .field("timeouts", &self.timeouts)

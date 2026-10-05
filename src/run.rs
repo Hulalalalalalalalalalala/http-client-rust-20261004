@@ -1,8 +1,8 @@
 use std::sync::{Arc, LazyLock};
 use std::{io, mem};
 
-use http::uri::Scheme;
-use http::{HeaderValue, Method, Request, Response, Uri, header};
+use http::uri::{PathAndQuery, Scheme};
+use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, header};
 use ureq_proto::BodyMode;
 use ureq_proto::client::state::{Await100, RecvBody, RecvResponse, Redirect, SendRequest};
 use ureq_proto::client::state::{Prepare, SendBody as SendBodyState};
@@ -10,7 +10,7 @@ use ureq_proto::client::{Await100Result, RecvBodyResult};
 use ureq_proto::client::{RecvResponseResult, SendRequestResult};
 
 use crate::body::ResponseInfo;
-use crate::config::{Config, DEFAULT_USER_AGENT, RequestLevelConfig};
+use crate::config::{Config, DEFAULT_USER_AGENT, RedirectAuthHeaders, RequestLevelConfig};
 use crate::http;
 use crate::pool::Connection;
 use crate::request::ForceSendBody;
@@ -41,6 +41,11 @@ pub(crate) fn run(
         .unwrap_or_else(|| (agent.config.clone(), false));
 
     let force_send_body = request.extensions_mut().remove::<ForceSendBody>().is_some();
+
+    // When body replay is enabled, keep a template of the original request
+    // to rebuild the call for 307/308 redirects. The URI is kept in sync
+    // with the latest call to resolve relative Location headers.
+    let mut replay_template = config.redirect_body_replay().then(|| request.clone());
 
     let mut redirect_history: Option<Vec<Uri>> =
         config.save_redirect_history().then_some(Vec::new());
@@ -78,10 +83,23 @@ pub(crate) fn run(
             &mut timings,
         )? {
             // Follow redirect
-            CallResult::Redirect(rcall, rtimings) => {
+            CallResult::Redirect(rcall, rtimings, location) => {
                 redirect_count += 1;
 
-                call = handle_redirect(rcall, &config)?;
+                call = handle_redirect(
+                    rcall,
+                    location,
+                    &config,
+                    replay_template.as_ref(),
+                    &mut body,
+                    force_send_body,
+                )?;
+
+                // Keep the template URI in sync with the latest call, so a
+                // relative Location header resolves against the most recent URI.
+                if let Some(template) = replay_template.as_mut() {
+                    *template.uri_mut() = call.uri().clone();
+                }
 
                 // If the new method doesn't need a body, clear it.
                 // This prevents Content-Length/Transfer-Encoding headers from being added
@@ -223,9 +241,10 @@ fn call_run(
 
             if response.status().is_redirection() {
                 if is_following_redirects {
+                    let location = response.headers().get(header::LOCATION).cloned();
                     let call = handler.consume_redirect_body()?;
 
-                    CallResult::Redirect(call, handler.timings)
+                    CallResult::Redirect(call, handler.timings, location)
                 } else if config.max_redirects_do_error() {
                     return Err(Error::TooManyRedirects);
                 } else {
@@ -239,7 +258,8 @@ fn call_run(
             cleanup(connection, call.must_close_connection(), timings.now());
 
             if is_following_redirects {
-                CallResult::Redirect(call, mem::take(timings))
+                let location = response.headers().get(header::LOCATION).cloned();
+                CallResult::Redirect(call, mem::take(timings), location)
             } else if config.max_redirects_do_error() {
                 return Err(Error::TooManyRedirects);
             } else {
@@ -259,7 +279,10 @@ fn call_run(
 #[allow(clippy::large_enum_variant)]
 enum CallResult {
     /// Call resulted in a redirect.
-    Redirect(Call<Redirect>, CallTimings),
+    ///
+    /// The `Location` header of the redirect response is carried along for
+    /// the body replay logic (ureq-proto does not expose it).
+    Redirect(Call<Redirect>, CallTimings, Option<HeaderValue>),
 
     /// Call resulted in a response.
     Response(Response<()>, BodyHandler),
@@ -541,9 +564,19 @@ fn recv_response(
     timings: &mut CallTimings,
     is_following_redirects: bool,
 ) -> Result<(Response<()>, RecvResponseResult), Error> {
+    // The server might have produced the final response while we were in the
+    // Await100 state (e.g. a redirect instead of 100 Continue). That response
+    // is already buffered, so attempt to parse it before waiting for more input.
+    let mut try_buffered_first = !connection.buffers().input().is_empty();
+
     let response = loop {
-        let timeout = timings.next_timeout(Timeout::RecvResponse);
-        let made_progress = connection.maybe_await_input(timeout)?;
+        let made_progress = if try_buffered_first {
+            try_buffered_first = false;
+            true
+        } else {
+            let timeout = timings.next_timeout(Timeout::RecvResponse);
+            connection.maybe_await_input(timeout)?
+        };
 
         let input = connection.buffers().input();
 
@@ -594,22 +627,200 @@ fn recv_response(
     Ok((response, call.proceed().unwrap()))
 }
 
-fn handle_redirect(mut call: Call<Redirect>, config: &Config) -> Result<Call<Prepare>, Error> {
-    let maybe_new_call = call.as_new_call(config.redirect_auth_headers())?;
+fn handle_redirect(
+    mut call: Call<Redirect>,
+    location: Option<HeaderValue>,
+    config: &Config,
+    replay_template: Option<&Request<()>>,
+    body: &mut SendBody,
+    force_send_body: bool,
+) -> Result<Call<Prepare>, Error> {
     let status = call.status();
 
-    if let Some(call) = maybe_new_call {
+    if let Some(new_call) = call.as_new_call(config.redirect_auth_headers())? {
         debug!(
             "Redirect ({}): {} {:?}",
             status,
-            call.method(),
-            DebugUri(call.uri())
+            new_call.method(),
+            DebugUri(new_call.uri())
         );
 
-        Ok(call)
-    } else {
-        Err(Error::RedirectFailed)
+        return Ok(new_call);
     }
+
+    // ureq-proto refused to follow the redirect. This happens for 307/308
+    // when the method carries a request body (POST/PUT/PATCH), and for
+    // DELETE. Only the former can be retried with a replayed body.
+    let is_307_308 = matches!(
+        status,
+        StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+    );
+
+    let template = replay_template.filter(|t| {
+        is_307_308 && matches!(t.method(), &Method::POST | &Method::PUT | &Method::PATCH)
+    });
+
+    let Some(template) = template else {
+        return Err(Error::RedirectFailed);
+    };
+
+    // Reset the body for replay. This fails (without reading anything) for
+    // bodies that cannot be replayed: files, streams, generic readers and
+    // response bodies. The redirect target must not receive anything for
+    // such bodies.
+    if !body.reset() {
+        debug!(
+            "Redirect ({}) refused: request body cannot be replayed",
+            status
+        );
+        return Err(Error::RedirectFailed);
+    }
+
+    // The location was already validated by as_new_call() above, so these
+    // should not fail; if they do, the redirect cannot be followed.
+    let location = location
+        .as_ref()
+        .and_then(|v| v.to_str().ok())
+        .ok_or(Error::RedirectFailed)?;
+
+    let new_uri =
+        join_redirect_uri(template.uri().clone(), location).ok_or(Error::RedirectFailed)?;
+
+    let mut request = template.clone();
+
+    let keep_auth_header = match config.redirect_auth_headers() {
+        RedirectAuthHeaders::SameHost => can_redirect_auth_header(request.uri(), &new_uri),
+        // Never, and any future variants, default to not keeping the header.
+        _ => false,
+    };
+
+    *request.uri_mut() = new_uri;
+
+    // Mutate the request to remove headers we cannot keep in the redirect.
+    // Unlike ureq-proto's as_new_call(), Content-Length and Transfer-Encoding
+    // are kept: the full body is replayed, so a caller-provided value is
+    // still correct, and automatically generated ones are re-added per call.
+    let headers = request.headers_mut();
+    if !keep_auth_header {
+        headers.remove(header::AUTHORIZATION);
+    }
+    // Cookies are re-added per call from the cookie jar.
+    headers.remove(header::COOKIE);
+
+    let mut new_call = Call::new(request)?;
+    new_call.allow_non_standard_methods(config.allow_non_standard_methods());
+
+    if force_send_body {
+        new_call.force_send_body();
+    }
+
+    debug!(
+        "Redirect ({}): {} {:?} (replaying request body)",
+        status,
+        new_call.method(),
+        DebugUri(new_call.uri())
+    );
+
+    Ok(new_call)
+}
+
+/// Whether an `Authorization` header can follow a redirect between two URIs.
+///
+/// Same logic as ureq-proto applies in `as_new_call()`.
+fn can_redirect_auth_header(prev: &Uri, next: &Uri) -> bool {
+    let host_prev = prev.authority().map(|a| a.host());
+    let host_next = next.authority().map(|a| a.host());
+    let scheme_prev = prev.scheme();
+    let scheme_next = next.scheme();
+    host_prev == host_next && (scheme_prev == scheme_next || scheme_next == Some(&Scheme::HTTPS))
+}
+
+/// Resolve a `Location` header value against the URI of the redirected request.
+///
+/// Same logic as ureq-proto applies in `as_new_call()`, which does not expose
+/// the resolved URI when it refuses to follow a 307/308 redirect with a body.
+fn join_redirect_uri(base: Uri, location: &str) -> Option<Uri> {
+    let mut parts = base.into_parts();
+
+    let maybe = location.parse::<Uri>();
+    let has_scheme = maybe
+        .as_ref()
+        .ok()
+        .map(|u| u.scheme().is_some())
+        .unwrap_or(false);
+
+    if has_scheme {
+        // Location is a complete Uri.
+        return maybe.ok();
+    }
+
+    if location.starts_with("//") {
+        // Location is a network-path reference, i.e. it holds its own
+        // authority and we only inherit the scheme of the base uri.
+        // https://datatracker.ietf.org/doc/html/rfc3986#section-4.2
+        let scheme = parts.scheme.as_ref()?;
+
+        let joined: Uri = format!("{}:{}", scheme.as_str(), location).parse().ok()?;
+
+        return Some(joined);
+    }
+
+    if location.starts_with("/") {
+        // Location is root-relative, i.e. we keep the
+        // authority of the base uri but replace the path
+        let pq: PathAndQuery = location.parse().ok()?;
+
+        parts.path_and_query = Some(pq);
+    } else {
+        // Location is relative, i.e. y/foo.html, ../ or ./ which means
+        // we should interpret it against the base uri path.
+        let base_path = parts
+            .path_and_query
+            .as_ref()
+            .map(|p| p.path())
+            .unwrap_or("/");
+
+        let total_path = join_relative_path(base_path, location)?;
+
+        let pq: PathAndQuery = total_path.parse().ok()?;
+
+        parts.path_and_query = Some(pq);
+    }
+
+    Uri::from_parts(parts).ok()
+}
+
+fn join_relative_path(base_path: &str, location: &str) -> Option<String> {
+    // base_path should be at least "/".
+    assert!(!base_path.is_empty());
+    // we should not attempt to join relative if location starts with "/"
+    assert!(!location.starts_with("/"));
+
+    let mut joiner: Vec<&str> = base_path.split('/').collect();
+
+    // "" => [""]
+    // "/" => ["", ""]
+    // "/foo" => ["", "foo"]
+    // "/foo/" => ["", "foo", ""]
+    if joiner.len() > 1 {
+        joiner.pop();
+    }
+
+    for segment in location.split('/') {
+        if segment == "." {
+            // do nothing
+        } else if segment == ".." {
+            if joiner.len() == 1 {
+                // Location is relative above root
+                return None;
+            }
+            joiner.pop();
+        } else {
+            joiner.push(segment);
+        }
+    }
+
+    Some(joiner.join("/"))
 }
 
 fn cleanup(connection: Connection, must_close: bool, now: Instant) {
@@ -773,5 +984,71 @@ impl BodyHandler {
 impl io::Read for BodyHandler {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.do_read(buf).map_err(|e| e.into_io())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn join_absolute_uri() {
+        let base: Uri = "https://example.com/a/b".parse().unwrap();
+        let uri = join_redirect_uri(base, "http://other.example.com/c").unwrap();
+        assert_eq!(uri, "http://other.example.com/c");
+    }
+
+    #[test]
+    fn join_root_relative_path() {
+        let base: Uri = "https://example.com/a/b".parse().unwrap();
+        let uri = join_redirect_uri(base, "/c").unwrap();
+        assert_eq!(uri, "https://example.com/c");
+    }
+
+    #[test]
+    fn join_relative_path() {
+        let base: Uri = "https://example.com/a/b".parse().unwrap();
+        let uri = join_redirect_uri(base, "c/d").unwrap();
+        assert_eq!(uri, "https://example.com/a/c/d");
+    }
+
+    #[test]
+    fn join_relative_path_dot_segments() {
+        let base: Uri = "https://example.com/a/b/c".parse().unwrap();
+        let uri = join_redirect_uri(base, "../d/./e").unwrap();
+        assert_eq!(uri, "https://example.com/a/d/e");
+    }
+
+    #[test]
+    fn join_network_path_reference() {
+        let base: Uri = "https://www.wikidata.org/wiki/Special:EntityData/Q2"
+            .parse()
+            .unwrap();
+        let uri =
+            join_redirect_uri(base, "//www.wikidata.org/wiki/Special:EntityData/Q2.ttl").unwrap();
+        assert_eq!(
+            uri,
+            "https://www.wikidata.org/wiki/Special:EntityData/Q2.ttl"
+        );
+    }
+
+    #[test]
+    fn join_network_path_reference_keeps_base_scheme() {
+        let base: Uri = "http://example.com/a/b".parse().unwrap();
+        let uri = join_redirect_uri(base, "//other.example.com/c").unwrap();
+        assert_eq!(uri, "http://other.example.com/c");
+    }
+
+    #[test]
+    fn join_network_path_reference_keeps_authority_details() {
+        let base: Uri = "https://example.com/x".parse().unwrap();
+        let uri = join_redirect_uri(base, "//other.example.com:8443/y?q=1").unwrap();
+        assert_eq!(uri, "https://other.example.com:8443/y?q=1");
+    }
+
+    #[test]
+    fn join_relative_above_root_fails() {
+        let base: Uri = "https://example.com/a".parse().unwrap();
+        assert!(join_redirect_uri(base, "../../x").is_none());
     }
 }

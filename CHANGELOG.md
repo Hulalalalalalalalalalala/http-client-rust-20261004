@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Add opt-in request body replay for 307/308 redirects via `redirect_body_replay` config
   * Retry socket reads interrupted by a signal (EINTR) when a timeout applies (technically breaking) #1205
   * Fix native-tls-no-default enabling dependencies without enabling the TLS connector
   * Add timeout_per_read and timeout_per_write independently of total phase budgets

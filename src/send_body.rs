@@ -21,6 +21,11 @@ pub struct SendBody<'a> {
     size: Option<Result<u64, Error>>,
     ended: bool,
     content_type: Option<HeaderValue>,
+
+    /// The full body for in-memory bodies, allowing the body to be reset
+    /// and replayed on 307/308 redirects. `None` for bodies that cannot
+    /// be replayed (files, streams, readers, response bodies).
+    replay: Option<&'a [u8]>,
 }
 
 impl<'a> SendBody<'a> {
@@ -47,6 +52,7 @@ impl<'a> SendBody<'a> {
             size: Some(size),
             ended: false,
             content_type: None,
+            replay: None,
         }
     }
 
@@ -170,6 +176,7 @@ impl<'a> SendBody<'a> {
             size: Some(Ok(bytes.len() as u64)),
             ended: false,
             content_type: None,
+            replay: Some(bytes),
         }
     }
 
@@ -189,6 +196,39 @@ impl<'a> SendBody<'a> {
             size: None,
             ended: false,
             content_type: None,
+            replay: None,
+        }
+    }
+
+    /// Reset the body to the start, so it can be sent again.
+    ///
+    /// This is used to replay the body on 307/308 redirects when
+    /// [`redirect_body_replay`][crate::config::ConfigBuilder::redirect_body_replay]
+    /// is enabled.
+    ///
+    /// Returns `true` if the body is held in memory and can be replayed.
+    /// Bodies such as files, streams, generic readers and response bodies
+    /// cannot be replayed and return `false` (and are not read as part of
+    /// this check).
+    pub(crate) fn reset(&mut self) -> bool {
+        match &mut self.inner {
+            // An empty body is trivially replayable.
+            BodyInner::None => true,
+            BodyInner::ByteSlice(v) => {
+                let Some(full) = self.replay else {
+                    return false;
+                };
+                *v = full;
+                self.ended = false;
+                true
+            }
+            #[cfg(feature = "json")]
+            BodyInner::ByteVec(v) => {
+                v.set_position(0);
+                self.ended = false;
+                true
+            }
+            BodyInner::Reader(_) | BodyInner::OwnedReader(_) | BodyInner::Body(_) => false,
         }
     }
 }
@@ -262,7 +302,7 @@ pub trait AsSendBody: Private {
 impl<'a> Private for SendBody<'a> {}
 impl<'a> AsSendBody for SendBody<'a> {
     fn as_body(&mut self) -> SendBody {
-        SendBody {
+        let mut body = SendBody {
             inner: match &mut self.inner {
                 BodyInner::None => BodyInner::None,
                 BodyInner::ByteSlice(v) => BodyInner::ByteSlice(v),
@@ -275,7 +315,19 @@ impl<'a> AsSendBody for SendBody<'a> {
             size: self.size.take(),
             ended: self.ended,
             content_type: self.content_type.take(),
+            // Option<&[u8]> is Copy, this does not borrow self.inner.
+            replay: self.replay,
+        };
+
+        // JSON bodies are converted to a ByteSlice of the entire vector
+        // above; that slice is the replay source.
+        if body.replay.is_none() {
+            if let BodyInner::ByteSlice(v) = &body.inner {
+                body.replay = Some(*v);
+            }
         }
+
+        body
     }
 }
 
@@ -346,6 +398,7 @@ impl AsSendBody for &File {
             size: Some(size),
             ended: false,
             content_type: None,
+            replay: None,
         }
     }
 }
@@ -359,6 +412,7 @@ impl AsSendBody for File {
             size: Some(size),
             ended: false,
             content_type: None,
+            replay: None,
         }
     }
 }
@@ -405,11 +459,18 @@ impl AsSendBody for UnixStream {
 
 impl<'a> From<(Option<u64>, BodyInner<'a>)> for SendBody<'a> {
     fn from((size, inner): (Option<u64>, BodyInner<'a>)) -> Self {
+        // In-memory bodies can be replayed on 307/308 redirects.
+        let replay = match &inner {
+            BodyInner::ByteSlice(v) => Some(*v),
+            _ => None,
+        };
+
         SendBody {
             inner,
             size: size.map(Ok),
             ended: false,
             content_type: None,
+            replay,
         }
     }
 }

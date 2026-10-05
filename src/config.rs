@@ -165,6 +165,7 @@ pub struct Config {
     max_redirects_will_error: bool,
     redirect_auth_headers: RedirectAuthHeaders,
     redirect_body_replay: bool,
+    retry_on_disconnect: bool,
     save_redirect_history: bool,
     user_agent: AutoHeaderValue,
     accept: AutoHeaderValue,
@@ -207,6 +208,7 @@ impl Config {
             max_redirects_will_error: _,
             redirect_auth_headers: _,
             redirect_body_replay: _,
+            retry_on_disconnect: _,
             save_redirect_history: _,
             accept: _,
             accept_encoding: _,
@@ -372,6 +374,31 @@ impl Config {
     /// Defaults to `false`.
     pub fn redirect_body_replay(&self) -> bool {
         self.redirect_body_replay
+    }
+
+    /// Whether to resend a request once when a reused connection fails.
+    ///
+    /// Connections taken from the pool may have been dropped by the server
+    /// while idle. When this is enabled and sending the request headers,
+    /// sending the request body or awaiting the response headers fails with
+    /// a disconnect (such as `BrokenPipe`, `ConnectionReset` or an
+    /// unexpected end of stream) before any response bytes arrived, ureq
+    /// discards the broken connection and resends the entire request once
+    /// on a freshly established connection.
+    ///
+    /// The resend only applies to the methods GET, HEAD, PUT, DELETE,
+    /// OPTIONS and TRACE, and only when the request body is empty or held
+    /// entirely in memory (such as `&str`, `&[u8]`, `String`, `Vec<u8>` and
+    /// bodies sent via the JSON or form helpers). Bodies backed by a
+    /// [`std::io::Read`] (files, network streams, etc) are never resent.
+    ///
+    /// At most one resend is made per call, including any redirects. The
+    /// resend shares the global and per-call timeout budgets of the failed
+    /// attempt; they are not restarted.
+    ///
+    /// Defaults to `false`.
+    pub fn retry_on_disconnect(&self) -> bool {
+        self.retry_on_disconnect
     }
 
     /// If we should record a history of every redirect location,
@@ -644,6 +671,32 @@ impl<Scope: private::ConfigScope> ConfigBuilder<Scope> {
     /// Defaults to `false`.
     pub fn redirect_body_replay(mut self, v: bool) -> Self {
         self.config().redirect_body_replay = v;
+        self
+    }
+
+    /// Whether to resend a request once when a reused connection fails.
+    ///
+    /// Connections taken from the pool may have been dropped by the server
+    /// while idle. When this is enabled and sending the request headers,
+    /// sending the request body or awaiting the response headers fails with
+    /// a disconnect (such as `BrokenPipe`, `ConnectionReset` or an
+    /// unexpected end of stream) before any response bytes arrived, ureq
+    /// discards the broken connection and resends the entire request once
+    /// on a freshly established connection.
+    ///
+    /// The resend only applies to the methods GET, HEAD, PUT, DELETE,
+    /// OPTIONS and TRACE, and only when the request body is empty or held
+    /// entirely in memory (such as `&str`, `&[u8]`, `String`, `Vec<u8>` and
+    /// bodies sent via the JSON or form helpers). Bodies backed by a
+    /// [`std::io::Read`] (files, network streams, etc) are never resent.
+    ///
+    /// At most one resend is made per call, including any redirects. The
+    /// resend shares the global and per-call timeout budgets of the failed
+    /// attempt; they are not restarted.
+    ///
+    /// Defaults to `false`.
+    pub fn retry_on_disconnect(mut self, v: bool) -> Self {
+        self.config().retry_on_disconnect = v;
         self
     }
 
@@ -1057,6 +1110,7 @@ impl Default for Config {
             max_redirects_will_error: true,
             redirect_auth_headers: RedirectAuthHeaders::Never,
             redirect_body_replay: false,
+            retry_on_disconnect: false,
             save_redirect_history: false,
             user_agent: AutoHeaderValue::default(),
             accept: AutoHeaderValue::default(),
@@ -1136,6 +1190,7 @@ impl fmt::Debug for Config {
             .field("max_redirects", &self.max_redirects)
             .field("redirect_auth_headers", &self.redirect_auth_headers)
             .field("redirect_body_replay", &self.redirect_body_replay)
+            .field("retry_on_disconnect", &self.retry_on_disconnect)
             .field("save_redirect_history", &self.save_redirect_history)
             .field("user_agent", &self.user_agent)
             .field("timeouts", &self.timeouts)

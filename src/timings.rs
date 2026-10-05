@@ -134,6 +134,17 @@ impl CallTimings {
         }
     }
 
+    /// Reset for resending the request of the current call.
+    ///
+    /// Unlike [`CallTimings::new_call`], the PerCall budget is not restarted.
+    /// Both the Global and PerCall budgets keep running from their original
+    /// start; only the recorded phase completions are cleared so each phase
+    /// budget applies afresh to the new connection.
+    pub(crate) fn new_attempt(mut self) -> CallTimings {
+        self.times.truncate(2); // Global and PerCall are in positions 0 and 1.
+        self
+    }
+
     pub(crate) fn current_time(&self) -> Arc<dyn Fn() -> Instant + Send + Sync + 'static> {
         self.current_time.0.clone()
     }

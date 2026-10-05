@@ -58,13 +58,15 @@ pub(crate) fn run(
     // are amended on the call and recomputed for each redirect hop.
     let mut template = request_template(&request);
 
-    let mut call = Call::new(request)?;
+    let mut call = prepare_call(request, force_send_body, &config)?;
 
-    if force_send_body {
-        call.force_send_body();
-    }
+    // Whether we already resent the request once. The entire run (including
+    // any redirects) is allowed at most one resend on a fresh connection.
+    let mut retry_used = false;
 
-    call.allow_non_standard_methods(config.allow_non_standard_methods());
+    // Set when the next attempt must use a newly established connection,
+    // bypassing any idle connections in the pool.
+    let mut fresh_connection = false;
 
     let (response, handler) = loop {
         let timeout = timings.next_timeout(Timeout::Global);
@@ -76,7 +78,10 @@ pub(crate) fn run(
             return Err(Error::Timeout(Timeout::Global));
         }
 
-        match call_run(
+        let mut attempt = Attempt::default();
+        let fresh = mem::take(&mut fresh_connection);
+
+        let result = call_run(
             agent,
             &config,
             request_level,
@@ -85,7 +90,44 @@ pub(crate) fn run(
             redirect_count,
             &mut redirect_history,
             &mut timings,
-        )? {
+            fresh,
+            &mut attempt,
+        );
+
+        let result = match result {
+            Ok(result) => result,
+            Err(err) => {
+                let can_retry = !retry_used
+                    && config.retry_on_disconnect()
+                    && attempt.can_retry()
+                    && method_allows_retry(template.method())
+                    && body.is_replayable()
+                    && is_disconnect(&err);
+
+                if !can_retry {
+                    return Err(err);
+                }
+
+                // The failed attempt and the resend share the Global and
+                // PerCall budgets. If the budget is already spent, do not
+                // connect again; report the earliest expired timeout.
+                let timeout = timings.next_timeout(Timeout::Resolve);
+                if timeout.after.is_zero() {
+                    return Err(Error::Timeout(timeout.reason));
+                }
+
+                debug!("Resending request on a fresh connection");
+
+                retry_used = true;
+                fresh_connection = true;
+                body.rewind();
+                call = prepare_call(request_template(&template), force_send_body, &config)?;
+                timings = timings.new_attempt();
+                continue;
+            }
+        };
+
+        match result {
             // Follow redirect
             CallResult::Redirect(rcall, rtimings, location) => {
                 redirect_count += 1;
@@ -187,6 +229,8 @@ fn call_run(
     redirect_count: u32,
     redirect_history: &mut Option<Vec<Uri>>,
     timings: &mut CallTimings,
+    fresh_connection: bool,
+    attempt: &mut Attempt,
 ) -> Result<CallResult, Error> {
     let uri = call.uri().clone();
     debug!("{} {:?}", call.method(), DebugUri(call.uri()));
@@ -197,7 +241,8 @@ fn call_run(
 
     add_headers(&mut call, agent, config, body, &uri)?;
 
-    let mut connection = connect(agent, config, request_level, &uri, timings)?;
+    let mut connection = connect(agent, config, request_level, &uri, timings, fresh_connection)?;
+    attempt.from_pool = connection.is_from_pool();
 
     let mut call = call.proceed();
 
@@ -214,10 +259,12 @@ fn call_run(
     }
 
     let call = match send_request(call, &mut connection, timings)? {
-        SendRequestResult::Await100(call) => match await_100(call, &mut connection, timings)? {
-            Await100Result::SendBody(call) => send_body(call, body, &mut connection, timings)?,
-            Await100Result::RecvResponse(call) => call,
-        },
+        SendRequestResult::Await100(call) => {
+            match await_100(call, &mut connection, timings, attempt)? {
+                Await100Result::SendBody(call) => send_body(call, body, &mut connection, timings)?,
+                Await100Result::RecvResponse(call) => call,
+            }
+        }
         SendRequestResult::SendBody(call) => send_body(call, body, &mut connection, timings)?,
         SendRequestResult::RecvResponse(call) => call,
     };
@@ -230,6 +277,7 @@ fn call_run(
         config,
         timings,
         is_following_redirects,
+        attempt,
     )?;
 
     debug!("{:?}", DebugResponse(&response));
@@ -310,6 +358,69 @@ enum CallResult {
 
     /// Call resulted in a response.
     Response(Response<()>, BodyHandler),
+}
+
+/// Build the call for one attempt of sending the request.
+fn prepare_call(
+    request: Request<()>,
+    force_send_body: bool,
+    config: &Config,
+) -> Result<Call<Prepare>, Error> {
+    let mut call = Call::new(request)?;
+
+    if force_send_body {
+        call.force_send_body();
+    }
+
+    call.allow_non_standard_methods(config.allow_non_standard_methods());
+
+    Ok(call)
+}
+
+/// State tracked while attempting to send a request once.
+///
+/// Used to decide whether a failed attempt may be resent on a fresh
+/// connection, see [`Config::retry_on_disconnect`].
+#[derive(Default)]
+struct Attempt {
+    /// The connection used for this attempt came out of the pool.
+    from_pool: bool,
+
+    /// Any response bytes (status line, headers, 100-continue) arrived.
+    response_started: bool,
+}
+
+impl Attempt {
+    /// A resend is only possible for a pooled connection that failed
+    /// before the server sent any response bytes.
+    fn can_retry(&self) -> bool {
+        self.from_pool && !self.response_started
+    }
+}
+
+/// Methods that are safe to resend in full.
+///
+/// POST, PATCH and any other method are never resent, even without a body.
+fn method_allows_retry(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS | Method::TRACE
+    )
+}
+
+/// Whether the error indicates the connection was dropped by the remote.
+fn is_disconnect(err: &Error) -> bool {
+    let Error::Io(e) = err else {
+        return false;
+    };
+
+    matches!(
+        e.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+    )
 }
 
 fn add_headers(
@@ -411,6 +522,7 @@ fn connect(
     request_level: bool,
     uri: &Uri,
     timings: &mut CallTimings,
+    fresh_connection: bool,
 ) -> Result<Connection, Error> {
     // Before resolving the URI we need to ensure it is a full URI. We
     // cannot make requests with partial uri like "/path".
@@ -449,7 +561,9 @@ fn connect(
 
     let use_pool = config.can_share_pool_with(&agent.config);
     let max_idle_age = config.max_idle_age().into();
-    let connection = agent.pool.connect(&details, max_idle_age, use_pool)?;
+    let connection = agent
+        .pool
+        .connect(&details, max_idle_age, use_pool, fresh_connection)?;
 
     if details.needs_tls() && !connection.is_tls() {
         return Err(Error::TlsRequired);
@@ -489,6 +603,7 @@ fn await_100(
     mut call: Call<Await100>,
     connection: &mut Connection,
     timings: &mut CallTimings,
+    attempt: &mut Attempt,
 ) -> Result<Await100Result, Error> {
     while call.can_keep_await_100() {
         let timeout = timings.next_timeout(Timeout::Await100);
@@ -507,6 +622,10 @@ fn await_100(
                 if input.is_empty() {
                     return Err(Error::disconnected("await_100 empty input"));
                 }
+
+                // Any response bytes (such as a 100-continue) mean the
+                // request reached the server and must not be resent.
+                attempt.response_started = true;
 
                 let amount = call.try_read_100(input)?;
                 if amount > 0 {
@@ -587,12 +706,19 @@ fn recv_response(
     config: &Config,
     timings: &mut CallTimings,
     is_following_redirects: bool,
+    attempt: &mut Attempt,
 ) -> Result<(Response<()>, RecvResponseResult), Error> {
     let response = loop {
         let timeout = timings.next_timeout(Timeout::RecvResponse);
         let made_progress = connection.maybe_await_input(timeout)?;
 
         let input = connection.buffers().input();
+
+        if made_progress || !input.is_empty() {
+            // Once any response bytes arrive (even a partial status line),
+            // the request must not be resent.
+            attempt.response_started = true;
+        }
 
         // If cookies are disabled, we can allow ourselves to follow
         // the redirect as soon as we discover the `Location` header.

@@ -31,15 +31,17 @@ impl ConnectionPool {
         details: &ConnectionDetails,
         max_idle_age: Duration,
         use_pool: bool,
+        fresh: bool,
     ) -> Result<Connection, Error> {
         let key = details.into();
 
-        if use_pool {
+        if use_pool && !fresh {
             let mut pool = self.pool.lock().unwrap();
             pool.purge(details.now);
 
-            if let Some(conn) = pool.get(&key, max_idle_age, details.now) {
+            if let Some(mut conn) = pool.get(&key, max_idle_age, details.now) {
                 debug!("Use pooled: {:?}", key);
+                conn.from_pool = true;
                 return Ok(conn);
             }
         }
@@ -50,6 +52,7 @@ impl ConnectionPool {
             transport,
             key,
             last_use: details.now,
+            from_pool: false,
             pool: if use_pool {
                 Arc::downgrade(&self.pool)
             } else {
@@ -84,6 +87,9 @@ pub(crate) struct Connection {
     transport: Box<dyn Transport>,
     key: PoolKey,
     last_use: Instant,
+    /// Whether this connection was taken out of the pool (rather than
+    /// newly established for the current call).
+    from_pool: bool,
     pool: Weak<Mutex<Pool>>,
 
     /// Used to prune max_idle_connections_by_host.
@@ -171,6 +177,11 @@ impl Connection {
 
     pub fn is_tls(&self) -> bool {
         self.transport.is_tls()
+    }
+
+    /// Whether this connection was taken out of the pool.
+    pub(crate) fn is_from_pool(&self) -> bool {
+        self.from_pool
     }
 
     fn age(&self, now: Instant) -> Duration {
@@ -502,6 +513,7 @@ mod config_pooling_tests {
             .proxy(None)
             .https_only(true)
             .http_status_as_error(false)
+            .retry_on_disconnect(true)
             .timeout_global(Some(std::time::Duration::from_secs(10)))
             .max_response_header_size(4096)
             .build();

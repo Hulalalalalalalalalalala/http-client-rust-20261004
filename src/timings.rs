@@ -96,6 +96,11 @@ pub(crate) struct CallTimings {
     per_write: Option<Duration>,
     current_time: CurrentTime,
     times: Vec<(Timeout, Instant)>,
+    /// Start of the per-call budget when it differs from the PerCall
+    /// record in `times`. Set by [`CallTimings::for_retry`], which
+    /// re-anchors the PerCall record so phase limits restart, while the
+    /// per-call budget keeps running from its original start.
+    per_call_start: Option<Instant>,
 }
 
 impl CallTimings {
@@ -112,6 +117,7 @@ impl CallTimings {
             per_write: None,
             current_time,
             times,
+            per_call_start: None,
         }
     }
 
@@ -124,6 +130,7 @@ impl CallTimings {
     pub(crate) fn new_call(mut self) -> CallTimings {
         self.times.truncate(1); // Global is in position 0.
         self.times.push((Timeout::PerCall, self.current_time.now()));
+        self.per_call_start = None;
 
         CallTimings {
             timeouts: self.timeouts,
@@ -131,6 +138,32 @@ impl CallTimings {
             per_write: self.per_write,
             current_time: self.current_time,
             times: self.times,
+            per_call_start: self.per_call_start,
+        }
+    }
+
+    /// Reset the per-phase records to resend the request on a new connection.
+    ///
+    /// Unlike [`CallTimings::new_call`], this keeps the per-call budget
+    /// running from its original start: a resend after a disconnect shares
+    /// the global and per-call budgets of the failed attempt, while each
+    /// phase limit (resolve, connect, send request, etc) applies afresh.
+    pub(crate) fn for_retry(mut self) -> CallTimings {
+        // Preserve the current per-call budget start before re-anchoring.
+        self.per_call_start = self
+            .per_call_start
+            .or_else(|| self.time_of(Timeout::PerCall));
+
+        self.times.truncate(1); // Global is in position 0.
+        self.times.push((Timeout::PerCall, self.current_time.now()));
+
+        CallTimings {
+            timeouts: self.timeouts,
+            per_read: self.per_read,
+            per_write: self.per_write,
+            current_time: self.current_time,
+            times: self.times,
+            per_call_start: self.per_call_start,
         }
     }
 
@@ -176,8 +209,11 @@ impl CallTimings {
                 let timeout = to_check.configured_timeout(&self.timeouts)?;
                 // Global and PerCall record their starts. Other timestamps
                 // record completion, which starts the next phase's budget.
+                // The per-call budget start is tracked separately since
+                // for_retry() re-anchors the PerCall record.
                 let time = match to_check {
-                    Timeout::Global | Timeout::PerCall => self.time_of(to_check),
+                    Timeout::Global => self.time_of(to_check),
+                    Timeout::PerCall => self.per_call_start.or_else(|| self.time_of(to_check)),
                     _ => to_check
                         .preceeding()
                         .filter_map(|previous| self.time_of(previous))
@@ -407,8 +443,102 @@ mod test {
     }
 
     #[test]
-    fn redirects_reset_per_call_but_not_global_budget() {
+    fn retry_shares_total_budgets_but_restarts_phase_limits() {
         let (mut timings, clock) = with_clock(Timeouts {
+            global: Some(StdDuration::from_secs(100)),
+            per_call: Some(StdDuration::from_secs(50)),
+            resolve: Some(StdDuration::from_secs(20)),
+            ..Timeouts::default()
+        });
+        let start = timings.now();
+
+        // The first attempt used 10 seconds before the connection
+        // turned out to be dead.
+        *clock.lock().unwrap() = start + Duration::from_secs(10);
+        timings.record_time(Timeout::Resolve);
+        timings.record_time(Timeout::Connect);
+
+        timings = timings.for_retry();
+
+        // The phase limit restarts from the resend, it does not
+        // continue from the original call start.
+        *clock.lock().unwrap() = start + Duration::from_secs(12);
+        assert_eq!(
+            timings.next_timeout(Timeout::Resolve),
+            NextTimeout {
+                after: Duration::from_secs(18),
+                reason: Timeout::Resolve,
+                ..NextTimeout::default()
+            }
+        );
+    }
+
+    #[test]
+    fn retry_keeps_per_call_budget_of_failed_attempt() {
+        let (mut timings, clock) = with_clock(Timeouts {
+            global: Some(StdDuration::from_secs(100)),
+            per_call: Some(StdDuration::from_secs(50)),
+            resolve: Some(StdDuration::from_secs(45)),
+            ..Timeouts::default()
+        });
+        let start = timings.now();
+
+        *clock.lock().unwrap() = start + Duration::from_secs(10);
+        timings.record_time(Timeout::Resolve);
+        timings.record_time(Timeout::Connect);
+
+        timings = timings.for_retry();
+
+        // The per-call budget is shared with the failed attempt:
+        // 50 seconds from the original call start.
+        *clock.lock().unwrap() = start + Duration::from_secs(45);
+        assert_eq!(
+            timings.next_timeout(Timeout::Resolve),
+            NextTimeout {
+                after: Duration::from_secs(5),
+                reason: Timeout::PerCall,
+                ..NextTimeout::default()
+            }
+        );
+
+        // Once the per-call budget is spent, it is reported as the
+        // earliest expiring timeout.
+        *clock.lock().unwrap() = start + Duration::from_secs(51);
+        let next = timings.next_timeout(Timeout::Resolve);
+        assert!(next.after.is_zero());
+        assert_eq!(next.reason, Timeout::PerCall);
+    }
+
+    #[test]
+    fn retry_then_redirect_resets_per_call_budget() {
+        let (mut timings, clock) = with_clock(Timeouts {
+            per_call: Some(StdDuration::from_secs(10)),
+            resolve: Some(StdDuration::from_secs(20)),
+            ..Timeouts::default()
+        });
+        let start = timings.now();
+
+        *clock.lock().unwrap() = start + Duration::from_secs(4);
+        timings.record_time(Timeout::Resolve);
+        timings = timings.for_retry();
+
+        // A redirect after the resend starts a new per-call budget.
+        *clock.lock().unwrap() = start + Duration::from_secs(6);
+        timings = timings.new_call();
+
+        *clock.lock().unwrap() = start + Duration::from_secs(12);
+        assert_eq!(
+            timings.next_timeout(Timeout::Resolve),
+            NextTimeout {
+                after: Duration::from_secs(4),
+                reason: Timeout::PerCall,
+                ..NextTimeout::default()
+            }
+        );
+    }
+
+    #[test]
+    fn redirects_reset_per_call_but_not_global_budget() {        let (mut timings, clock) = with_clock(Timeouts {
             global: Some(StdDuration::from_secs(30)),
             per_call: Some(StdDuration::from_secs(10)),
             resolve: Some(StdDuration::from_secs(20)),

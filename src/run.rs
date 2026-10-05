@@ -66,6 +66,14 @@ pub(crate) fn run(
 
     call.allow_non_standard_methods(config.allow_non_standard_methods());
 
+    // Whether the request has been resent after a disconnect. The entire
+    // run (including any redirects) may resend at most once.
+    let mut retried = false;
+
+    // Whether the next call must establish a fresh connection instead of
+    // reusing an idle pooled one. Set for the resend after a disconnect.
+    let mut bypass_pool = false;
+
     let (response, handler) = loop {
         let timeout = timings.next_timeout(Timeout::Global);
         let timed_out = match timeout.after {
@@ -76,7 +84,7 @@ pub(crate) fn run(
             return Err(Error::Timeout(Timeout::Global));
         }
 
-        match call_run(
+        let failure = match call_run(
             agent,
             &config,
             request_level,
@@ -85,9 +93,11 @@ pub(crate) fn run(
             redirect_count,
             &mut redirect_history,
             &mut timings,
-        )? {
+            bypass_pool,
+        ) {
             // Follow redirect
-            CallResult::Redirect(rcall, rtimings, location) => {
+            Ok(CallResult::Redirect(rcall, rtimings, location)) => {
+                bypass_pool = false;
                 redirect_count += 1;
 
                 let status = rcall.status();
@@ -137,11 +147,59 @@ pub(crate) fn run(
                 template = request_template_from_call(&call);
 
                 timings = rtimings.new_call();
+
+                continue;
             }
 
             // Return response
-            CallResult::Response(response, handler) => break (response, handler),
+            Ok(CallResult::Response(response, handler)) => break (response, handler),
+
+            Err(failure) => failure,
+        };
+
+        // The call failed. Resending is allowed at most once per run(),
+        // only when the failure was a disconnect on a pooled connection
+        // before any response bytes arrived, and only for methods and
+        // bodies that are safe to send again.
+        let can_retry = !retried
+            && config.retry_disconnected()
+            && failure.retryable
+            && retryable_method(template.method())
+            && body.is_replayable();
+
+        if !can_retry {
+            return Err(failure.error);
         }
+
+        retried = true;
+
+        // The resend shares the global and per-call budgets of the failed
+        // attempt. Only the per-phase records restart.
+        timings = timings.for_retry();
+
+        // If the budget is already spent, do not connect or send again.
+        let timeout = timings.next_timeout(Timeout::Resolve);
+        let timed_out = match timeout.after {
+            Duration::Exact(v) => v.is_zero(),
+            Duration::NotHappening => false,
+        };
+        if timed_out {
+            return Err(Error::Timeout(timeout.reason));
+        }
+
+        debug!("Resending request on a fresh connection");
+
+        body.rewind();
+
+        let mut resend = Call::new(request_template(&template))?;
+        if force_send_body {
+            resend.force_send_body();
+        }
+        resend.allow_non_standard_methods(config.allow_non_standard_methods());
+        call = resend;
+
+        // The resend must not pick up another idle pooled connection.
+        bypass_pool = true;
     };
 
     let (mut parts, _) = response.into_parts();
@@ -187,17 +245,22 @@ fn call_run(
     redirect_count: u32,
     redirect_history: &mut Option<Vec<Uri>>,
     timings: &mut CallTimings,
-) -> Result<CallResult, Error> {
+    bypass_pool: bool,
+) -> Result<CallResult, CallFailure> {
     let uri = call.uri().clone();
     debug!("{} {:?}", call.method(), DebugUri(call.uri()));
 
     if config.https_only() && uri.scheme() != Some(&Scheme::HTTPS) {
-        return Err(Error::RequireHttpsOnly(uri.to_string()));
+        return Err(Error::RequireHttpsOnly(uri.to_string()).into());
     }
 
     add_headers(&mut call, agent, config, body, &uri)?;
 
-    let mut connection = connect(agent, config, request_level, &uri, timings)?;
+    let mut connection = connect(agent, config, request_level, &uri, timings, bypass_pool)?;
+
+    // Resending is only possible on connections taken from the pool. A
+    // failure on a freshly established connection is returned directly.
+    let from_pool = connection.is_from_pool();
 
     let mut call = call.proceed();
 
@@ -213,24 +276,32 @@ fn call_run(
         debug!("{:?}", r);
     }
 
-    let call = match send_request(call, &mut connection, timings)? {
-        SendRequestResult::Await100(call) => match await_100(call, &mut connection, timings)? {
-            Await100Result::SendBody(call) => send_body(call, body, &mut connection, timings)?,
-            Await100Result::RecvResponse(call) => call,
-        },
-        SendRequestResult::SendBody(call) => send_body(call, body, &mut connection, timings)?,
-        SendRequestResult::RecvResponse(call) => call,
-    };
-
     let is_following_redirects = redirect_count < config.max_redirects();
 
-    let (mut response, response_result) = recv_response(
+    // Tracks whether any response bytes (status line, headers or a
+    // 100-continue) arrived. A disconnect after that point is final.
+    let mut received_response = false;
+
+    let result = send_and_recv(
         call,
+        body,
         &mut connection,
         config,
         timings,
         is_following_redirects,
-    )?;
+        &mut received_response,
+    );
+
+    let (mut response, response_result) = result.map_err(|failure| {
+        // The broken connection is discarded by dropping it here.
+        let retryable = from_pool
+            && !received_response
+            && matches!(failure, PhaseFailure::Disconnect(_));
+        CallFailure {
+            error: failure.into_error(),
+            retryable,
+        }
+    })?;
 
     debug!("{:?}", DebugResponse(&response));
 
@@ -273,7 +344,7 @@ fn call_run(
 
                     CallResult::Redirect(call, handler.timings, location)
                 } else if config.max_redirects_do_error() {
-                    return Err(Error::TooManyRedirects);
+                    return Err(Error::TooManyRedirects.into());
                 } else {
                     CallResult::Response(response, handler)
                 }
@@ -288,7 +359,7 @@ fn call_run(
                 let location = response.headers().get(header::LOCATION).cloned();
                 CallResult::Redirect(call, mem::take(timings), location)
             } else if config.max_redirects_do_error() {
-                return Err(Error::TooManyRedirects);
+                return Err(Error::TooManyRedirects.into());
             } else {
                 CallResult::Response(response, BodyHandler::default())
             }
@@ -310,6 +381,130 @@ enum CallResult {
 
     /// Call resulted in a response.
     Response(Response<()>, BodyHandler),
+}
+
+/// Error from [`call_run`].
+struct CallFailure {
+    error: Error,
+
+    /// The failure was a disconnect on a connection taken from the pool,
+    /// before any response bytes were received. Only such failures are
+    /// candidates for resending the request on a fresh connection.
+    retryable: bool,
+}
+
+impl From<Error> for CallFailure {
+    fn from(error: Error) -> Self {
+        CallFailure {
+            error,
+            retryable: false,
+        }
+    }
+}
+
+impl From<ureq_proto::Error> for CallFailure {
+    fn from(error: ureq_proto::Error) -> Self {
+        Error::from(error).into()
+    }
+}
+
+/// Failure of the send/receive phases of a call, classified so [`run`]
+/// can decide whether the request may be resent on a fresh connection.
+enum PhaseFailure {
+    /// The connection was lost. A candidate for resending, provided no
+    /// response bytes were received and the connection came from the pool.
+    Disconnect(Error),
+
+    /// Any other failure. Never resent.
+    Other(Error),
+}
+
+impl PhaseFailure {
+    /// Classify a transport error. Only I/O errors indicating a lost
+    /// connection are disconnects; timeouts, protocol errors and other
+    /// failures are not.
+    fn transport(error: Error) -> Self {
+        if is_disconnect_error(&error) {
+            PhaseFailure::Disconnect(error)
+        } else {
+            PhaseFailure::Other(error)
+        }
+    }
+
+    fn into_error(self) -> Error {
+        match self {
+            PhaseFailure::Disconnect(e) | PhaseFailure::Other(e) => e,
+        }
+    }
+}
+
+impl From<ureq_proto::Error> for PhaseFailure {
+    fn from(error: ureq_proto::Error) -> Self {
+        PhaseFailure::Other(error.into())
+    }
+}
+
+/// Whether the error indicates the connection was lost.
+///
+/// This covers the transport returning a broken pipe, reset or aborted
+/// connection, as well as reaching the end of the stream before any
+/// data was received.
+fn is_disconnect_error(error: &Error) -> bool {
+    match error {
+        Error::Io(e) => matches!(
+            e.kind(),
+            io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
+}
+
+/// Whether a failed request with this method may be resent on a fresh
+/// connection. POST, PATCH and other methods are never resent.
+fn retryable_method(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS | Method::TRACE
+    )
+}
+
+/// Run the phases of a call from sending the request headers up to
+/// having a parsed response.
+#[allow(clippy::too_many_arguments)]
+fn send_and_recv(
+    call: Call<SendRequest>,
+    body: &mut SendBody,
+    connection: &mut Connection,
+    config: &Config,
+    timings: &mut CallTimings,
+    is_following_redirects: bool,
+    received_response: &mut bool,
+) -> Result<(Response<()>, RecvResponseResult), PhaseFailure> {
+    let call = match send_request(call, connection, timings).map_err(PhaseFailure::transport)? {
+        SendRequestResult::Await100(call) => {
+            match await_100(call, connection, timings, received_response)
+                .map_err(PhaseFailure::transport)?
+            {
+                Await100Result::SendBody(call) => send_body(call, body, connection, timings)?,
+                Await100Result::RecvResponse(call) => call,
+            }
+        }
+        SendRequestResult::SendBody(call) => send_body(call, body, connection, timings)?,
+        SendRequestResult::RecvResponse(call) => call,
+    };
+
+    recv_response(
+        call,
+        connection,
+        config,
+        timings,
+        is_following_redirects,
+        received_response,
+    )
+    .map_err(PhaseFailure::transport)
 }
 
 fn add_headers(
@@ -411,6 +606,7 @@ fn connect(
     request_level: bool,
     uri: &Uri,
     timings: &mut CallTimings,
+    bypass_pool: bool,
 ) -> Result<Connection, Error> {
     // Before resolving the URI we need to ensure it is a full URI. We
     // cannot make requests with partial uri like "/path".
@@ -449,7 +645,9 @@ fn connect(
 
     let use_pool = config.can_share_pool_with(&agent.config);
     let max_idle_age = config.max_idle_age().into();
-    let connection = agent.pool.connect(&details, max_idle_age, use_pool)?;
+    let connection = agent
+        .pool
+        .connect(&details, max_idle_age, use_pool, bypass_pool)?;
 
     if details.needs_tls() && !connection.is_tls() {
         return Err(Error::TlsRequired);
@@ -489,6 +687,7 @@ fn await_100(
     mut call: Call<Await100>,
     connection: &mut Connection,
     timings: &mut CallTimings,
+    received_response: &mut bool,
 ) -> Result<Await100Result, Error> {
     while call.can_keep_await_100() {
         let timeout = timings.next_timeout(Timeout::Await100);
@@ -507,6 +706,9 @@ fn await_100(
                 if input.is_empty() {
                     return Err(Error::disconnected("await_100 empty input"));
                 }
+
+                // Any response bytes rule out resending the request.
+                *received_response = true;
 
                 let amount = call.try_read_100(input)?;
                 if amount > 0 {
@@ -536,7 +738,7 @@ fn send_body(
     body: &mut SendBody,
     connection: &mut Connection,
     timings: &mut CallTimings,
-) -> Result<Call<RecvResponse>, Error> {
+) -> Result<Call<RecvResponse>, PhaseFailure> {
     loop {
         if call.can_proceed() {
             break;
@@ -554,7 +756,12 @@ fn send_body(
         let output_used = if !call.is_chunked() {
             // For non-chunked, The body can be written directly to the output.
             // This optimizes away a memcopy if we were to go via call.write().
-            let output_used = body.read(output)?;
+            //
+            // A failure to read the request body is not a disconnect and
+            // must not be resent.
+            let output_used = body
+                .read(output)
+                .map_err(|e| PhaseFailure::Other(Error::from(e)))?;
 
             // Size checking is still in the call.
             call.consume_direct_write(output_used)?;
@@ -562,7 +769,9 @@ fn send_body(
             output_used
         } else {
             let tmp = &mut tmp[..max_input];
-            let n = body.read(tmp)?;
+            let n = body
+                .read(tmp)
+                .map_err(|e| PhaseFailure::Other(Error::from(e)))?;
 
             let (input_used, output_used) = call.write(&tmp[..n], output)?;
 
@@ -574,7 +783,9 @@ fn send_body(
         };
 
         let timeout = timings.next_timeout(Timeout::SendBody);
-        connection.transmit_output(output_used, timeout)?;
+        connection
+            .transmit_output(output_used, timeout)
+            .map_err(PhaseFailure::transport)?;
     }
 
     timings.record_time(Timeout::SendBody);
@@ -587,12 +798,18 @@ fn recv_response(
     config: &Config,
     timings: &mut CallTimings,
     is_following_redirects: bool,
+    received_response: &mut bool,
 ) -> Result<(Response<()>, RecvResponseResult), Error> {
     let response = loop {
         let timeout = timings.next_timeout(Timeout::RecvResponse);
         let made_progress = connection.maybe_await_input(timeout)?;
 
         let input = connection.buffers().input();
+
+        // Any response bytes rule out resending the request.
+        if !input.is_empty() {
+            *received_response = true;
+        }
 
         // If cookies are disabled, we can allow ourselves to follow
         // the redirect as soon as we discover the `Location` header.

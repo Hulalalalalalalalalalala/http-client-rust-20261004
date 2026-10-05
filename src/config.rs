@@ -165,6 +165,7 @@ pub struct Config {
     max_redirects_will_error: bool,
     redirect_auth_headers: RedirectAuthHeaders,
     redirect_body_replay: bool,
+    retry_disconnected: bool,
     save_redirect_history: bool,
     user_agent: AutoHeaderValue,
     accept: AutoHeaderValue,
@@ -207,6 +208,7 @@ impl Config {
             max_redirects_will_error: _,
             redirect_auth_headers: _,
             redirect_body_replay: _,
+            retry_disconnected: _,
             save_redirect_history: _,
             accept: _,
             accept_encoding: _,
@@ -372,6 +374,33 @@ impl Config {
     /// Defaults to `false`.
     pub fn redirect_body_replay(&self) -> bool {
         self.redirect_body_replay
+    }
+
+    /// Whether to resend a request once when a reused pooled connection
+    /// turns out to be disconnected.
+    ///
+    /// A connection taken from the pool might have been silently dropped by
+    /// the server (or an intermediary) without ureq noticing. The failure
+    /// then surfaces as an I/O error while sending the request headers,
+    /// sending the request body or awaiting the response headers. With this
+    /// setting enabled, ureq discards the broken connection and resends the
+    /// request once on a freshly established connection, but only if no
+    /// response bytes (including a `100 Continue`) were received before the
+    /// failure.
+    ///
+    /// Resending is limited to the methods GET, HEAD, PUT, DELETE, OPTIONS
+    /// and TRACE, and to request bodies that are empty or held in memory
+    /// (such as `&str`, `&[u8]`, `String`, `Vec<u8>` and bodies sent via
+    /// the JSON or form helpers). Bodies backed by a [`std::io::Read`]
+    /// (files, network streams, etc) are never resent, even if a
+    /// `Content-Length` is known.
+    ///
+    /// The resend shares the global and per-call timeouts of the failed
+    /// attempt; those budgets are not restarted.
+    ///
+    /// Defaults to `false`.
+    pub fn retry_disconnected(&self) -> bool {
+        self.retry_disconnected
     }
 
     /// If we should record a history of every redirect location,
@@ -644,6 +673,34 @@ impl<Scope: private::ConfigScope> ConfigBuilder<Scope> {
     /// Defaults to `false`.
     pub fn redirect_body_replay(mut self, v: bool) -> Self {
         self.config().redirect_body_replay = v;
+        self
+    }
+
+    /// Whether to resend a request once when a reused pooled connection
+    /// turns out to be disconnected.
+    ///
+    /// A connection taken from the pool might have been silently dropped by
+    /// the server (or an intermediary) without ureq noticing. The failure
+    /// then surfaces as an I/O error while sending the request headers,
+    /// sending the request body or awaiting the response headers. With this
+    /// setting enabled, ureq discards the broken connection and resends the
+    /// request once on a freshly established connection, but only if no
+    /// response bytes (including a `100 Continue`) were received before the
+    /// failure.
+    ///
+    /// Resending is limited to the methods GET, HEAD, PUT, DELETE, OPTIONS
+    /// and TRACE, and to request bodies that are empty or held in memory
+    /// (such as `&str`, `&[u8]`, `String`, `Vec<u8>` and bodies sent via
+    /// the JSON or form helpers). Bodies backed by a [`std::io::Read`]
+    /// (files, network streams, etc) are never resent, even if a
+    /// `Content-Length` is known.
+    ///
+    /// The resend shares the global and per-call timeouts of the failed
+    /// attempt; those budgets are not restarted.
+    ///
+    /// Defaults to `false`.
+    pub fn retry_disconnected(mut self, v: bool) -> Self {
+        self.config().retry_disconnected = v;
         self
     }
 
@@ -1057,6 +1114,7 @@ impl Default for Config {
             max_redirects_will_error: true,
             redirect_auth_headers: RedirectAuthHeaders::Never,
             redirect_body_replay: false,
+            retry_disconnected: false,
             save_redirect_history: false,
             user_agent: AutoHeaderValue::default(),
             accept: AutoHeaderValue::default(),
@@ -1136,6 +1194,7 @@ impl fmt::Debug for Config {
             .field("max_redirects", &self.max_redirects)
             .field("redirect_auth_headers", &self.redirect_auth_headers)
             .field("redirect_body_replay", &self.redirect_body_replay)
+            .field("retry_disconnected", &self.retry_disconnected)
             .field("save_redirect_history", &self.save_redirect_history)
             .field("user_agent", &self.user_agent)
             .field("timeouts", &self.timeouts)

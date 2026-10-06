@@ -249,4 +249,546 @@ mod test {
             err
         );
     }
+
+    /// Gzip-compress a byte slice twice.
+    fn gzip_compress_twice(data: &[u8]) -> Vec<u8> {
+        gzip_compress(&gzip_compress(data))
+    }
+
+    // A sequence containing a coding whose feature flag is not enabled is
+    // not decompressed at all, even though the other codings are supported.
+    #[test]
+    #[cfg(not(feature = "brotli"))]
+    fn gz_unsupported_coding_not_decompressed() {
+        init_test_log();
+
+        let original = b"hello";
+        let compressed = gzip_compress(original);
+        let compressed_len = compressed.len().to_string();
+
+        // Comma-separated in one header.
+        set_handler(
+            "/gz_unsupported",
+            200,
+            &[
+                ("content-encoding", "gzip, br"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_unsupported").call().unwrap();
+        assert_eq!(
+            res.headers()
+                .get("content-encoding")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "gzip, br"
+        );
+        assert_eq!(res.body().content_length(), Some(compressed.len() as u64));
+        let body = res.body_mut().read_to_vec().unwrap();
+        assert_eq!(body, compressed);
+
+        // Split over two headers.
+        set_handler(
+            "/gz_unsupported_split",
+            200,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-encoding", "br"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_unsupported_split")
+            .call()
+            .unwrap();
+        assert_eq!(res.body().content_length(), Some(compressed.len() as u64));
+        let body = res.body_mut().read_to_vec().unwrap();
+        assert_eq!(body, compressed);
+    }
+
+    // A body compressed twice is listed as `gzip, gzip` and must be decoded
+    // twice, delivering the original content rather than the intermediate
+    // compressed bytes.
+    #[test]
+    fn gz_double_gzip_single_header() {
+        init_test_log();
+
+        let original = b"hello hello hello, multi-layer world!";
+        let compressed = gzip_compress_twice(original);
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_double",
+            200,
+            &[
+                ("content-encoding", "gzip, gzip"),
+                ("content-length", &compressed_len),
+                ("content-type", "text/plain"),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_double").call().unwrap();
+
+        // Headers are stripped like for single-layer decompression.
+        assert!(res.headers().get("content-encoding").is_none());
+        assert!(res.headers().get("content-length").is_none());
+        assert!(res.body().content_length().is_none());
+        assert_eq!(
+            res.headers().get("content-type").unwrap().to_str().unwrap(),
+            "text/plain",
+        );
+
+        let body = res.body_mut().read_to_string().unwrap();
+        assert_eq!(body, "hello hello hello, multi-layer world!");
+    }
+
+    // The same sequence spread over multiple `Content-Encoding` headers is
+    // one sequence in the order the values were received.
+    #[test]
+    fn gz_double_gzip_multiple_headers() {
+        init_test_log();
+
+        let original = b"hello hello hello, multi-layer world!";
+        let compressed = gzip_compress_twice(original);
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_double_multi",
+            200,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-encoding", "gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_double_multi").call().unwrap();
+        let body = res.body_mut().read_to_string().unwrap();
+        assert_eq!(body, "hello hello hello, multi-layer world!");
+    }
+
+    // Coding names are case-insensitive and may be surrounded by spaces
+    // and tabs.
+    #[test]
+    fn gz_coding_names_case_and_whitespace() {
+        init_test_log();
+
+        let original = b"hello hello hello, multi-layer world!";
+        let compressed = gzip_compress_twice(original);
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_case",
+            200,
+            &[
+                ("content-encoding", "GZip ,\tgzip\t"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_case").call().unwrap();
+        let body = res.body_mut().read_to_string().unwrap();
+        assert_eq!(body, "hello hello hello, multi-layer world!");
+    }
+
+    // A sequence containing an unknown coding is not decompressed at all.
+    // All Content-Encoding values and the Content-Length are preserved.
+    #[test]
+    fn gz_unknown_coding_not_decompressed() {
+        init_test_log();
+
+        let original = b"hello";
+        let compressed = gzip_compress(original);
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_unknown",
+            200,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-encoding", "deflate"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_unknown").call().unwrap();
+
+        // Both Content-Encoding values and the Content-Length are preserved.
+        let mut encodings = res.headers().get_all("content-encoding").iter();
+        assert_eq!(encodings.next().unwrap().to_str().unwrap(), "gzip");
+        assert_eq!(encodings.next().unwrap().to_str().unwrap(), "deflate");
+        assert!(encodings.next().is_none());
+        assert_eq!(
+            res.headers()
+                .get("content-length")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            compressed_len
+        );
+        assert_eq!(res.body().content_length(), Some(compressed.len() as u64));
+
+        // The body is the untouched compressed bytes.
+        let body = res.body_mut().read_to_vec().unwrap();
+        assert_eq!(body, compressed);
+    }
+
+    // An empty item in the sequence opts the entire sequence out of
+    // decompression.
+    #[test]
+    fn gz_empty_coding_not_decompressed() {
+        init_test_log();
+
+        let original = b"hello";
+        let compressed = gzip_compress(original);
+        let compressed_len = compressed.len().to_string();
+
+        for (i, encoding) in ["gzip,,gzip", "gzip,"].iter().enumerate() {
+            let path = format!("/gz_empty_{}", i);
+            // Leak to get a &'static str for the test handler.
+            let path: &'static str = Box::leak(path.into_boxed_str());
+
+            set_handler(
+                path,
+                200,
+                &[
+                    ("content-encoding", encoding),
+                    ("content-length", &compressed_len),
+                ],
+                &compressed,
+            );
+
+            let mut res = crate::get(&format!("https://my.test{}", path))
+                .call()
+                .unwrap();
+
+            assert_eq!(
+                res.headers()
+                    .get("content-encoding")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                *encoding
+            );
+            assert_eq!(res.body().content_length(), Some(compressed.len() as u64));
+
+            let body = res.body_mut().read_to_vec().unwrap();
+            assert_eq!(body, compressed);
+        }
+    }
+
+    // The limit counts the final output bytes, not any intermediate or
+    // transfer size, also for multi-layer bodies.
+    #[test]
+    fn gz_double_gzip_limit() {
+        init_test_log();
+
+        let original = vec![b'a'; 1000];
+        let compressed = gzip_compress_twice(&original);
+        let compressed_len = compressed.len().to_string();
+
+        // A decompressed body of exactly the limit size ends normally.
+        set_handler(
+            "/gz_double_limit_exact",
+            200,
+            &[
+                ("content-encoding", "gzip, gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+        let mut res = crate::get("https://my.test/gz_double_limit_exact")
+            .call()
+            .unwrap();
+        let v = res
+            .body_mut()
+            .with_config()
+            .limit(1000)
+            .read_to_vec()
+            .unwrap();
+        assert_eq!(v, original);
+
+        // One byte less than the decompressed size exceeds the limit.
+        set_handler(
+            "/gz_double_limit_exceeded",
+            200,
+            &[
+                ("content-encoding", "gzip, gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+        let mut res = crate::get("https://my.test/gz_double_limit_exceeded")
+            .call()
+            .unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(999)
+            .read_to_vec()
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::BodyExceedsLimit(999)));
+    }
+
+    // A corrupt inner gzip layer (the encoding the server applied first)
+    // surfaces as a gzip decompression error. It must not be rewritten by
+    // the outer layer, and it must surface even when the output limit is
+    // already reached.
+    #[test]
+    fn gz_double_gzip_inner_corrupt() {
+        init_test_log();
+
+        let original = b"hello";
+        let mut inner = gzip_compress(original);
+        // Corrupt the CRC32 of the inner gzip trailer.
+        let n = inner.len();
+        inner[n - 8] ^= 0xFF;
+        let compressed = gzip_compress(&inner);
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_double_inner_corrupt",
+            200,
+            &[
+                ("content-encoding", "gzip, gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_double_inner_corrupt")
+            .call()
+            .unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(5)
+            .read_to_vec()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Decompress("gzip", _)),
+            "expected gzip decompression error, got: {:?}",
+            err
+        );
+    }
+
+    // A corrupt outer gzip layer surfaces as a gzip decompression error.
+    #[test]
+    fn gz_double_gzip_outer_corrupt() {
+        init_test_log();
+
+        let mut compressed = gzip_compress_twice(b"hello");
+        // Corrupt the CRC32 of the outer gzip trailer.
+        let n = compressed.len();
+        compressed[n - 8] ^= 0xFF;
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_double_outer_corrupt",
+            200,
+            &[
+                ("content-encoding", "gzip, gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_double_outer_corrupt")
+            .call()
+            .unwrap();
+        let err = res
+            .body_mut()
+            .with_config()
+            .limit(5)
+            .read_to_vec()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Decompress("gzip", _)),
+            "expected gzip decompression error, got: {:?}",
+            err
+        );
+    }
+
+    // The HTTP body is received in full (Content-Length is satisfied), but
+    // the compressed data itself is truncated. That is a decompression
+    // error, not a clean end of body.
+    #[test]
+    fn gz_truncated_stream() {
+        init_test_log();
+
+        let full = gzip_compress(b"hello");
+        let compressed = &full[..full.len() - 4];
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_truncated",
+            200,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-length", &compressed_len),
+            ],
+            compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_truncated").call().unwrap();
+        let err = res.body_mut().read_to_vec().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Decompress("gzip", _)),
+            "expected gzip decompression error, got: {:?}",
+            err
+        );
+    }
+
+    // Same, but the outer layer of a double-compressed body is truncated.
+    #[test]
+    fn gz_double_gzip_truncated_stream() {
+        init_test_log();
+
+        let full = gzip_compress_twice(b"hello");
+        let compressed = &full[..full.len() - 4];
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_double_truncated",
+            200,
+            &[
+                ("content-encoding", "gzip, gzip"),
+                ("content-length", &compressed_len),
+            ],
+            compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_double_truncated")
+            .call()
+            .unwrap();
+        let err = res.body_mut().read_to_vec().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Decompress("gzip", _)),
+            "expected gzip decompression error, got: {:?}",
+            err
+        );
+    }
+
+    // Reading a multi-layer body in small chunks yields the same content
+    // as reading it to the end at once.
+    #[test]
+    fn gz_double_gzip_chunked_reads() {
+        init_test_log();
+
+        let original: Vec<u8> = (0..1000).map(|i| (i % 251) as u8).collect();
+        let compressed = gzip_compress_twice(&original);
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_double_chunks",
+            200,
+            &[
+                ("content-encoding", "gzip, gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_double_chunks").call().unwrap();
+        let mut reader = res.body_mut().as_reader();
+
+        use std::io::Read;
+        let mut out = Vec::new();
+        // Varying small buffer sizes, including 1-byte reads.
+        for size in [1, 7, 3, 64, 2, 100] {
+            let mut buf = vec![0u8; size];
+            loop {
+                let n = reader.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+        }
+        assert_eq!(out, original);
+    }
+
+    // Multi-layer decompression works the same for chunked transfer
+    // encoding: headers are stripped and content_length() is None.
+    #[test]
+    fn gz_double_gzip_chunked_transfer() {
+        init_test_log();
+
+        let original = b"hello hello hello, multi-layer world!";
+        let compressed = gzip_compress_twice(original);
+
+        let mut body = format!("{:x}\r\n", compressed.len()).into_bytes();
+        body.extend_from_slice(&compressed);
+        body.extend_from_slice(b"\r\n0\r\n\r\n");
+
+        set_handler(
+            "/gz_double_chunked",
+            200,
+            &[
+                ("transfer-encoding", "chunked"),
+                ("content-encoding", "gzip, gzip"),
+            ],
+            &body,
+        );
+
+        let mut res = crate::get("https://my.test/gz_double_chunked")
+            .call()
+            .unwrap();
+
+        assert!(res.headers().get("content-encoding").is_none());
+        assert!(res.body().content_length().is_none());
+
+        let body = res.body_mut().read_to_string().unwrap();
+        assert_eq!(body, "hello hello hello, multi-layer world!");
+    }
+
+    // A decompressed multi-layer body used as a subsequent request body
+    // sends the full decompressed content. The compressed Content-Length
+    // must not truncate the output.
+    #[test]
+    fn gz_double_gzip_as_send_body() {
+        init_test_log();
+
+        let original: Vec<u8> = (0..1000).map(|i| (i % 251) as u8).collect();
+        let compressed = gzip_compress_twice(&original);
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_double_send",
+            200,
+            &[
+                ("content-encoding", "gzip, gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_double_send").call().unwrap();
+
+        use crate::AsSendBody;
+        use ureq_proto::BodyMode;
+        let mut send_body = res.body_mut().as_body();
+
+        // The outgoing body cannot reuse the compressed length.
+        assert_eq!(send_body.body_mode().unwrap(), BodyMode::Chunked);
+
+        let mut out = Vec::new();
+        let mut buf = [0u8; 128];
+        loop {
+            let n = send_body.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(out, original);
+    }
 }

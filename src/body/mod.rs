@@ -677,21 +677,86 @@ fn json_error(e: serde_json::Error) -> Error {
     Error::Json(e)
 }
 
-#[derive(Debug, Clone, Copy)]
+/// The `Content-Encoding` of a response.
+///
+/// A server can apply multiple encodings to a body. The codings are either
+/// listed comma-separated in a single `Content-Encoding` header, or spread
+/// over several headers of the same name. Both forms are understood as one
+/// sequence in the order the values were received, which is the order the
+/// server applied the codings.
+#[derive(Debug, Clone)]
 enum ContentEncoding {
+    /// No `Content-Encoding` header.
     None,
+    /// A sequence of recognized content codings, in the order the server
+    /// applied them.
+    Sequence(Vec<ContentCoding>),
+    /// At least one listed coding is unknown, empty or otherwise invalid.
+    /// The body is passed through untouched.
+    Unknown,
+}
+
+/// A single recognized content coding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentCoding {
     Gzip,
     Brotli,
-    Unknown,
+}
+
+impl ContentEncoding {
+    fn from_headers(headers: &http::HeaderMap) -> Self {
+        let mut sequence = vec![];
+
+        for value in headers.get_all(header::CONTENT_ENCODING) {
+            let Ok(value) = value.to_str() else {
+                debug!("Content-Encoding is not valid ASCII");
+                return ContentEncoding::Unknown;
+            };
+
+            for name in value.split(',') {
+                // Optional whitespace around a coding is space or tab.
+                let name = name.trim_matches(|c| c == ' ' || c == '\t');
+                let Some(coding) = ContentCoding::from_name(name) else {
+                    // Unknown, empty or invalid coding. Opts the entire
+                    // sequence out of automatic decompression.
+                    return ContentEncoding::Unknown;
+                };
+                sequence.push(coding);
+            }
+        }
+
+        if sequence.is_empty() {
+            ContentEncoding::None
+        } else {
+            ContentEncoding::Sequence(sequence)
+        }
+    }
+}
+
+impl ContentCoding {
+    fn from_name(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("gzip") {
+            Some(ContentCoding::Gzip)
+        } else if name.eq_ignore_ascii_case("br") {
+            Some(ContentCoding::Brotli)
+        } else {
+            debug!("Unknown content-encoding: {}", name);
+            None
+        }
+    }
+
+    /// Whether the feature flag for this coding is enabled.
+    fn is_supported(&self) -> bool {
+        match self {
+            ContentCoding::Gzip => cfg!(feature = "gzip"),
+            ContentCoding::Brotli => cfg!(feature = "brotli"),
+        }
+    }
 }
 
 impl ResponseInfo {
     pub fn new(headers: &http::HeaderMap, body_mode: BodyMode) -> Self {
-        let content_encoding = headers
-            .get(header::CONTENT_ENCODING)
-            .and_then(|v| v.to_str().ok())
-            .map(ContentEncoding::from)
-            .unwrap_or(ContentEncoding::None);
+        let content_encoding = ContentEncoding::from_headers(headers);
 
         let (mime_type, charset) = headers
             .get(header::CONTENT_TYPE)
@@ -707,14 +772,26 @@ impl ResponseInfo {
         }
     }
 
-    /// Returns true if the body will be decompressed (gzip or brotli).
+    /// Returns true if the body will be decompressed (gzip and/or brotli).
     pub(crate) fn is_decompressing(&self) -> bool {
-        match self.content_encoding {
-            #[cfg(feature = "gzip")]
-            ContentEncoding::Gzip => true,
-            #[cfg(feature = "brotli")]
-            ContentEncoding::Brotli => true,
-            _ => false,
+        self.decodings().is_some()
+    }
+
+    /// The content codings to decode, in the order they must be decoded.
+    ///
+    /// The server applied the codings in the listed order, so decoding
+    /// happens in reverse. Returns `None` unless every coding in the
+    /// sequence is supported by the enabled feature flags (**gzip**,
+    /// **brotli**) — a single unknown, invalid or unsupported coding opts
+    /// the entire sequence out of automatic decompression.
+    fn decodings(&self) -> Option<impl Iterator<Item = ContentCoding> + '_> {
+        match &self.content_encoding {
+            ContentEncoding::Sequence(sequence)
+                if sequence.iter().all(ContentCoding::is_supported) =>
+            {
+                Some(sequence.iter().rev().copied())
+            }
+            _ => None,
         }
     }
 
@@ -770,8 +847,14 @@ fn split_content_type(content_type: &str) -> (Option<String>, Option<String>) {
 ///
 /// 1. If `Transfer-Encoding: chunked`, the returned reader will unchunk it
 ///    and any `Content-Length` header is ignored.
-/// 2. If `Content-Encoding: gzip` (or `br`) and the corresponding feature
-///    flag is enabled (**gzip** and **brotli**), decompresses the body data.
+/// 2. If `Content-Encoding` lists content codings — a single one like
+///    `gzip`, or a sequence like `gzip, gzip` for a body compressed
+///    multiple times (possibly spread over several `Content-Encoding`
+///    headers) — and every coding is supported by the enabled feature
+///    flags (**gzip** and **brotli**), decompresses the body data. The
+///    codings are decoded in the reverse of the order the server applied
+///    them. If any coding is unknown or not enabled, the body is passed
+///    through untouched.
 /// 3. Given a header like `Content-Type: text/plain; charset=ISO-8859-1`
 ///    and the **charset** feature enabled, will translate the body to utf-8.
 ///    This mechanic need two components a mime-type starting `text/` and
@@ -812,7 +895,7 @@ fn split_content_type(content_type: &str) -> (Option<String>, Option<String>) {
 pub struct BodyReader<'a> {
     // The limit is outermost, so it counts the final output bytes: after
     // decompression, charset conversion and lossy utf-8 replacement.
-    reader: LimitReader<MaybeLossyDecoder<CharsetDecoder<ContentDecoder<BodySourceRef<'a>>>>>,
+    reader: LimitReader<MaybeLossyDecoder<CharsetDecoder<ContentDecoder<'a>>>>,
     // If this reader is used as SendBody for another request, this
     // body mode can indiciate the content-length. Gzip, charset etc
     // would mean input is not same as output.
@@ -831,25 +914,18 @@ impl<'a> BodyReader<'a> {
         // in a proxy situation.
         let mut outgoing_body_mode = incoming_body_mode;
 
-        let reader = match info.content_encoding {
-            ContentEncoding::None | ContentEncoding::Unknown => ContentDecoder::PassThrough(reader),
-            #[cfg(feature = "gzip")]
-            ContentEncoding::Gzip => {
-                debug!("Decoding gzip");
-                outgoing_body_mode = BodyMode::Chunked;
-                ContentDecoder::Gzip(Box::new(gzip::GzipDecoder::new(reader)))
+        let mut reader: ContentDecoder<'a> = Box::new(reader);
+
+        // Decompress the entire sequence of content codings, but only if
+        // every coding is supported by the enabled feature flags. The
+        // server applied the codings in the listed order, so they are
+        // decoded in reverse, stacking decoders on top of each other.
+        if let Some(decodings) = info.decodings() {
+            outgoing_body_mode = BodyMode::Chunked;
+            for coding in decodings {
+                reader = content_decoder(coding, reader);
             }
-            #[cfg(not(feature = "gzip"))]
-            ContentEncoding::Gzip => ContentDecoder::PassThrough(reader),
-            #[cfg(feature = "brotli")]
-            ContentEncoding::Brotli => {
-                debug!("Decoding brotli");
-                outgoing_body_mode = BodyMode::Chunked;
-                ContentDecoder::Brotli(Box::new(brotli::BrotliDecoder::new(reader)))
-            }
-            #[cfg(not(feature = "brotli"))]
-            ContentEncoding::Brotli => ContentDecoder::PassThrough(reader),
-        };
+        }
 
         let reader = if info.is_text() {
             charset_decoder(
@@ -951,42 +1027,41 @@ impl<R: io::Read> io::Read for CharsetDecoder<R> {
     }
 }
 
-enum ContentDecoder<R: io::Read> {
-    #[cfg(feature = "gzip")]
-    Gzip(Box<gzip::GzipDecoder<R>>),
-    #[cfg(feature = "brotli")]
-    Brotli(Box<brotli::BrotliDecoder<R>>),
-    PassThrough(R),
-}
+/// The content decoding stage of the body reader.
+///
+/// A response can carry a sequence of content codings (for instance
+/// `Content-Encoding: gzip, gzip` for a body compressed twice). The codings
+/// are decoded by stacking decoders on top of each other, which requires
+/// dynamic dispatch since the number of layers is only known at runtime.
+type ContentDecoder<'a> = Box<dyn io::Read + Send + Sync + 'a>;
 
-impl<R: io::Read> io::Read for ContentDecoder<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            #[cfg(feature = "gzip")]
-            ContentDecoder::Gzip(v) => v.read(buf),
-            #[cfg(feature = "brotli")]
-            ContentDecoder::Brotli(v) => v.read(buf),
-            ContentDecoder::PassThrough(v) => v.read(buf),
+/// Wrap the reader in the decoder for one content coding.
+#[cfg_attr(
+    not(any(feature = "gzip", feature = "brotli")),
+    allow(unused_variables)
+)]
+fn content_decoder<'a>(coding: ContentCoding, reader: ContentDecoder<'a>) -> ContentDecoder<'a> {
+    match coding {
+        #[cfg(feature = "gzip")]
+        ContentCoding::Gzip => {
+            debug!("Decoding gzip");
+            Box::new(gzip::GzipDecoder::new(reader))
         }
+        #[cfg(feature = "brotli")]
+        ContentCoding::Brotli => {
+            debug!("Decoding brotli");
+            Box::new(brotli::BrotliDecoder::new(reader))
+        }
+        // Codings without an enabled feature flag never get here;
+        // `ResponseInfo::decodings()` rules out unsupported codings.
+        #[allow(unreachable_patterns)]
+        _ => unreachable!("content coding is not supported"),
     }
 }
 
 impl fmt::Debug for Body {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Body").finish()
-    }
-}
-
-impl From<&str> for ContentEncoding {
-    fn from(s: &str) -> Self {
-        match s {
-            "gzip" => ContentEncoding::Gzip,
-            "br" => ContentEncoding::Brotli,
-            _ => {
-                debug!("Unknown content-encoding: {}", s);
-                ContentEncoding::Unknown
-            }
-        }
     }
 }
 

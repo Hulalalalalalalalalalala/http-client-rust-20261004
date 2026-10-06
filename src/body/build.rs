@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use ureq_proto::BodyMode;
 
-use super::{Body, BodyDataSource, ContentEncoding, ResponseInfo};
+use super::{Body, BodyDataSource, ResponseInfo};
 
 /// Builder for creating a response body.
 ///
@@ -42,7 +42,7 @@ impl BodyBuilder {
     pub(crate) fn new() -> Self {
         BodyBuilder {
             info: ResponseInfo {
-                content_encoding: ContentEncoding::None,
+                content_encodings: Vec::new(),
                 mime_type: None,
                 charset: None,
                 body_mode: BodyMode::NoBody,

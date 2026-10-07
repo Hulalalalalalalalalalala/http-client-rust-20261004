@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub use build::BodyBuilder;
 use ureq_proto::BodyMode;
@@ -105,6 +105,15 @@ pub struct Body {
 enum BodyDataSource {
     Handler(Box<BodyHandler>),
     Reader(Box<dyn io::Read + Send + Sync>),
+    /// The source wrapped in the content/charset decoder chain.
+    ///
+    /// The chain is built at most once per body and then shared by every
+    /// reader, so a new reader resumes exactly where the previous one
+    /// stopped. This matters for stateful decoders like gzip, which buffer
+    /// compressed input and decompressed output internally — rebuilding the
+    /// chain for each reader would lose that state and restart decoding in
+    /// the middle of the compressed stream.
+    Decoded(Box<dyn io::Read + Send + Sync>),
 }
 
 #[derive(Clone)]
@@ -113,6 +122,12 @@ pub(crate) struct ResponseInfo {
     mime_type: Option<String>,
     charset: Option<String>,
     body_mode: BodyMode,
+    /// The limit a reader confirmed the body to exceed, if any.
+    ///
+    /// Shared by all readers of the same body: once any reader confirms the
+    /// body is larger than its configured limit, every subsequent non-empty
+    /// read — from any reader of this body — reports that same limit.
+    limit_exceeded: Arc<Mutex<Option<u64>>>,
 }
 
 impl Body {
@@ -419,6 +434,7 @@ impl Body {
     /// # Ok::<_, ureq::Error>(())
     /// ```
     pub fn with_config(&mut self) -> BodyWithConfig {
+        self.ensure_decoded();
         let handler = (&mut self.source).into();
         BodyWithConfig::new(handler, self.info.clone())
     }
@@ -448,9 +464,54 @@ impl Body {
     /// ureq has 1GB of RAM, you could protect the machine by setting a smaller
     /// limit such as 128MB. The exact number will vary by your client's download
     /// needs, available system resources, and system utilization.
-    pub fn into_with_config(self) -> BodyWithConfig<'static> {
+    pub fn into_with_config(mut self) -> BodyWithConfig<'static> {
+        self.ensure_decoded();
         let handler = self.source.into();
         BodyWithConfig::new(handler, self.info)
+    }
+
+    /// Wrap the source in the content/charset decoder chain, if any decoding
+    /// applies.
+    ///
+    /// This happens at most once per body. The chain is stored in the body
+    /// and shared by every subsequent reader (borrowed or owned), so readers
+    /// resume exactly where the previous reader stopped — a stateful decoder
+    /// (gzip/brotli) keeps its internal buffers between readers, and ending
+    /// a borrow neither reads more from the network nor discards decoded
+    /// content not yet delivered to the caller.
+    fn ensure_decoded(&mut self) {
+        if matches!(self.source, BodyDataSource::Decoded(_)) {
+            return;
+        }
+
+        if !self.info.is_decompressing() && !converts_charset(&self.info) {
+            // No decoding applies; readers use the source directly.
+            return;
+        }
+
+        // Take ownership of the current source to wrap it. The placeholder
+        // is replaced below before anyone can observe it.
+        let source = std::mem::replace(
+            &mut self.source,
+            BodyDataSource::Reader(Box::new(io::empty())),
+        );
+        let reader: BodySourceRef<'static> = source.into();
+
+        let mut outgoing_body_mode = self.info.body_mode;
+        let reader = content_decoders(reader, &self.info, &mut outgoing_body_mode);
+
+        let reader = if self.info.is_text() {
+            charset_decoder(
+                reader,
+                self.info.mime_type.as_deref(),
+                self.info.charset.as_deref(),
+                &mut outgoing_body_mode,
+            )
+        } else {
+            CharsetDecoder::PassThrough(reader)
+        };
+
+        self.source = BodyDataSource::Decoded(Box::new(reader));
     }
 }
 
@@ -524,13 +585,7 @@ impl<'a> BodyWithConfig<'a> {
     }
 
     fn do_build(self) -> BodyReader<'a> {
-        BodyReader::new(
-            self.handler,
-            self.limit,
-            &self.info,
-            self.info.body_mode,
-            self.lossy_utf8,
-        )
+        BodyReader::new(self.handler, self.limit, &self.info, self.lossy_utf8)
     }
 
     /// Creates a reader.
@@ -741,6 +796,7 @@ impl ResponseInfo {
             mime_type,
             charset,
             body_mode,
+            limit_exceeded: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -851,8 +907,12 @@ fn split_content_type(content_type: &str) -> (Option<String>, Option<String>) {
 /// ```
 pub struct BodyReader<'a> {
     // The limit is outermost, so it counts the final output bytes: after
-    // decompression, charset conversion and lossy utf-8 replacement.
-    reader: LimitReader<MaybeLossyDecoder<CharsetDecoder<ContentDecoder<'a>>>>,
+    // decompression, charset conversion and lossy utf-8 replacement. The
+    // content/charset decoder chain is not part of this reader; it is
+    // shared by all readers of the same body (see Body::ensure_decoded),
+    // which is what allows a new reader to resume where a previous one
+    // stopped.
+    reader: LimitReader<MaybeLossyDecoder<BodySourceRef<'a>>>,
     // If this reader is used as SendBody for another request, this
     // body mode can indiciate the content-length. Gzip, charset etc
     // would mean input is not same as output.
@@ -889,26 +949,8 @@ impl<'a> BodyReader<'a> {
         reader: BodySourceRef<'a>,
         limit: u64,
         info: &ResponseInfo,
-        incoming_body_mode: BodyMode,
         lossy_utf8: bool,
     ) -> BodyReader<'a> {
-        // This is outgoing body_mode in case we are using the BodyReader as a send body
-        // in a proxy situation.
-        let mut outgoing_body_mode = incoming_body_mode;
-
-        let reader = content_decoders(reader, info, &mut outgoing_body_mode);
-
-        let reader = if info.is_text() {
-            charset_decoder(
-                reader,
-                info.mime_type.as_deref(),
-                info.charset.as_deref(),
-                &mut outgoing_body_mode,
-            )
-        } else {
-            CharsetDecoder::PassThrough(reader)
-        };
-
         let reader = if info.is_text() && lossy_utf8 {
             MaybeLossyDecoder::Lossy(LossyUtf8Reader::new(reader))
         } else {
@@ -918,10 +960,14 @@ impl<'a> BodyReader<'a> {
         // The size limit applies to the output bytes the caller receives,
         // i.e. after decompression, charset conversion and lossy utf-8
         // replacement. A body that ends exactly at the limit is not an error.
-        let reader = LimitReader::new(reader, limit);
+        //
+        // Each reader counts only the bytes it delivers itself, but once any
+        // reader confirms the limit is exceeded, that outcome is shared with
+        // all later readers of the same body.
+        let reader = LimitReader::new(reader, limit, info.limit_exceeded.clone());
 
         BodyReader {
-            outgoing_body_mode,
+            outgoing_body_mode: outgoing_body_mode(info),
             reader,
         }
     }
@@ -929,6 +975,41 @@ impl<'a> BodyReader<'a> {
     pub(crate) fn body_mode(&self) -> BodyMode {
         self.outgoing_body_mode
     }
+}
+
+/// The body mode to use if this body is reused as a send body in a proxy
+/// situation.
+///
+/// Decompression and charset conversion change the byte count, so a decoded
+/// body must be sent chunked; anything else keeps the incoming body mode.
+fn outgoing_body_mode(info: &ResponseInfo) -> BodyMode {
+    if info.is_decompressing() || converts_charset(info) {
+        BodyMode::Chunked
+    } else {
+        info.body_mode
+    }
+}
+
+/// Whether the charset decoder will actually convert the body.
+///
+/// Mirrors the decision in [`charset_decoder`]: a text body with a known
+/// non-UTF-8 charset (and the **charset** feature enabled).
+#[cfg(feature = "charset")]
+fn converts_charset(info: &ResponseInfo) -> bool {
+    use encoding_rs::{Encoding, UTF_8};
+
+    info.is_text()
+        && info
+            .charset
+            .as_deref()
+            .and_then(|c| Encoding::for_label(c.as_bytes()))
+            .map(|from| from != UTF_8)
+            .unwrap_or(false)
+}
+
+#[cfg(not(feature = "charset"))]
+fn converts_charset(_info: &ResponseInfo) -> bool {
+    false
 }
 
 /// Wrap the reader in one decoder per content-coding.
@@ -1055,6 +1136,7 @@ impl<'a> From<&'a mut BodyDataSource> for BodySourceRef<'a> {
         match value {
             BodyDataSource::Handler(v) => Self::HandlerShared(v),
             BodyDataSource::Reader(v) => Self::ReaderShared(v),
+            BodyDataSource::Decoded(v) => Self::ReaderShared(v),
         }
     }
 }
@@ -1064,6 +1146,7 @@ impl From<BodyDataSource> for BodySourceRef<'static> {
         match value {
             BodyDataSource::Handler(v) => Self::HandlerOwned(v),
             BodyDataSource::Reader(v) => Self::ReaderOwned(v),
+            BodyDataSource::Decoded(v) => Self::ReaderOwned(v),
         }
     }
 }

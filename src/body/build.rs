@@ -46,6 +46,7 @@ impl BodyBuilder {
                 mime_type: None,
                 charset: None,
                 body_mode: BodyMode::NoBody,
+                limit_exceeded: Default::default(),
             },
             limit: None,
         }

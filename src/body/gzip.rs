@@ -674,4 +674,366 @@ mod test {
         }
         assert_eq!(out, original);
     }
+
+    // Reading a gzip body through a sequence of readers — as_reader(),
+    // with_config().reader() and read_to_vec() — must deliver exactly the
+    // same bytes as reading the body in one go: no repeats, no gaps, no
+    // decompression errors in the middle of the content. Covers both
+    // Content-Length and chunked transfer.
+    #[test]
+    fn gz_split_reads_across_readers() {
+        init_test_log();
+
+        use std::io::Read;
+
+        let original: Vec<u8> = (0..3000u32).map(|i| (i % 253) as u8).collect();
+        let compressed = gzip_compress(&original);
+        let compressed_len = compressed.len().to_string();
+
+        let mut chunked = Vec::new();
+        // Split the compressed data over several chunks to also vary how
+        // the data arrives.
+        for piece in compressed.chunks(7) {
+            chunked.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+            chunked.extend_from_slice(piece);
+            chunked.extend_from_slice(b"\r\n");
+        }
+        chunked.extend_from_slice(b"0\r\n\r\n");
+
+        set_handler(
+            "/gz_split_len",
+            200,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+        set_handler(
+            "/gz_split_chunked",
+            200,
+            &[
+                ("content-encoding", "gzip"),
+                ("transfer-encoding", "chunked"),
+            ],
+            &chunked,
+        );
+
+        for path in ["/gz_split_len", "/gz_split_chunked"] {
+            let mut res = crate::get(&format!("https://my.test{}", path))
+                .call()
+                .unwrap();
+
+            let mut out = Vec::new();
+
+            // First reader: a small borrowed read, then the borrow ends.
+            {
+                let mut reader = res.body_mut().as_reader();
+                let mut buf = [0u8; 3];
+                reader.read_exact(&mut buf).unwrap();
+                out.extend_from_slice(&buf);
+            }
+
+            // Second reader: a configured borrowed reader.
+            {
+                let mut reader = res.body_mut().with_config().reader();
+                let mut buf = [0u8; 100];
+                let n = reader.read(&mut buf).unwrap();
+                assert!(n > 0);
+                out.extend_from_slice(&buf[..n]);
+            }
+
+            // Third reader: read the rest to the end.
+            let rest = res.body_mut().read_to_vec().unwrap();
+            out.extend_from_slice(&rest);
+
+            assert_eq!(out, original, "split reads must equal one-shot read");
+
+            // After a complete read, a new reader is immediately empty.
+            let mut reader = res.body_mut().as_reader();
+            let mut buf = [0u8; 8];
+            assert_eq!(reader.read(&mut buf).unwrap(), 0);
+        }
+    }
+
+    // The same resumability requirement holds for a body compressed twice.
+    #[test]
+    fn gz_double_split_reads_across_readers() {
+        init_test_log();
+
+        use std::io::Read;
+
+        let original: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+        let compressed = gzip_compress(&gzip_compress(&original));
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_double_split",
+            200,
+            &[
+                ("content-encoding", "gzip, gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_double_split")
+            .call()
+            .unwrap();
+
+        let mut out = Vec::new();
+        {
+            let mut reader = res.body_mut().as_reader();
+            let mut buf = [0u8; 5];
+            reader.read_exact(&mut buf).unwrap();
+            out.extend_from_slice(&buf);
+        }
+        let rest = res.body_mut().read_to_vec().unwrap();
+        out.extend_from_slice(&rest);
+
+        assert_eq!(out, original);
+    }
+
+    // A body first read through a borrowed reader continues at the same
+    // position when turned into an owned reader, and the owned reader can
+    // be sent to another thread.
+    #[test]
+    fn gz_borrowed_then_into_reader_on_another_thread() {
+        init_test_log();
+
+        use std::io::Read;
+
+        let original: Vec<u8> = (0..1000u32).map(|i| (i % 241) as u8).collect();
+        let compressed = gzip_compress(&original);
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_into",
+            200,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_into").call().unwrap();
+
+        let mut prefix = [0u8; 10];
+        res.body_mut().as_reader().read_exact(&mut prefix).unwrap();
+
+        let body = res.into_body();
+        let mut reader = body.into_reader();
+
+        let rest = std::thread::spawn(move || {
+            let mut v = Vec::new();
+            reader.read_to_end(&mut v).unwrap();
+            v
+        })
+        .join()
+        .unwrap();
+
+        let mut out = prefix.to_vec();
+        out.extend_from_slice(&rest);
+        assert_eq!(out, original);
+    }
+
+    // Each with_config() limit counts only the decompressed bytes that read
+    // delivers, not what earlier readers took. After taking 3 bytes, a
+    // remaining 5 bytes pass a limit of 5, while a remaining 6 bytes fail
+    // with BodyExceedsLimit(5).
+    #[test]
+    fn gz_limit_counts_per_reader() {
+        init_test_log();
+
+        use std::io::Read;
+
+        for (original, expect_ok) in [(b"12345678".as_slice(), true), (b"123456789".as_slice(), false)] {
+            let compressed = gzip_compress(original);
+            let compressed_len = compressed.len().to_string();
+
+            let path = if expect_ok { "/gz_lim_ok" } else { "/gz_lim_err" };
+            set_handler(
+                path,
+                200,
+                &[
+                    ("content-encoding", "gzip"),
+                    ("content-length", &compressed_len),
+                ],
+                &compressed,
+            );
+
+            let mut res = crate::get(&format!("https://my.test{}", path))
+                .call()
+                .unwrap();
+
+            // Take 3 bytes without any limit.
+            let mut prefix = [0u8; 3];
+            res.body_mut().as_reader().read_exact(&mut prefix).unwrap();
+            assert_eq!(&prefix, b"123");
+
+            // The rest is original.len() - 3 bytes; limit it to 5.
+            let result = res.body_mut().with_config().limit(5).read_to_vec();
+            if expect_ok {
+                assert_eq!(result.unwrap(), b"45678");
+            } else {
+                let err = result.unwrap_err();
+                assert!(
+                    matches!(err, crate::Error::BodyExceedsLimit(5)),
+                    "expected BodyExceedsLimit(5), got: {:?}",
+                    err
+                );
+            }
+        }
+    }
+
+    // Reading only part of what the limit allows and ending the borrow does
+    // not trip the limit; the next reader continues normally. But once a
+    // limit is confirmed exceeded, every later non-empty read of the body
+    // reports that same limit — switching readers does not unlock more data.
+    #[test]
+    fn gz_limit_exceeded_sticks_across_readers() {
+        init_test_log();
+
+        use std::io::Read;
+
+        let original = b"0123456789";
+        let compressed = gzip_compress(original);
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_lim_stick",
+            200,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_lim_stick").call().unwrap();
+
+        // Take 2 bytes under a limit of 5: within the limit, no exceedance.
+        {
+            let mut reader = res.body_mut().with_config().limit(5).reader();
+            let mut buf = [0u8; 2];
+            reader.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"01");
+        }
+
+        // A new reader with limit 3 reads 3 bytes, then confirms the exceed.
+        {
+            let mut reader = res.body_mut().with_config().limit(3).reader();
+            let mut buf = [0u8; 3];
+            reader.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"234");
+            // The body has more output, so the limit of 3 is exceeded.
+            let err = reader.read(&mut buf).unwrap_err();
+            assert!(
+                matches!(crate::Error::from(err), crate::Error::BodyExceedsLimit(3)),
+            );
+        }
+
+        // A fresh reader — even with a larger limit — keeps reporting the
+        // limit that was confirmed exceeded.
+        {
+            let mut reader = res.body_mut().with_config().limit(100).reader();
+            let mut buf = [0u8; 4];
+            // An empty read is still a no-op.
+            assert_eq!(reader.read(&mut []).unwrap(), 0);
+            let err = reader.read(&mut buf).unwrap_err();
+            assert!(
+                matches!(crate::Error::from(err), crate::Error::BodyExceedsLimit(3)),
+            );
+        }
+
+        // read_to_vec reports the same.
+        let err = res.body_mut().read_to_vec().unwrap_err();
+        assert!(matches!(err, crate::Error::BodyExceedsLimit(3)));
+    }
+
+    // The connection must not return to the pool while decompressed content
+    // remains undelivered, even if all compressed bytes already arrived.
+    // Once the body is read to the end, the connection is reused as before.
+    #[test]
+    fn gz_pool_reuse_only_after_fully_read() {
+        init_test_log();
+
+        use std::io::Read;
+
+        let original = vec![b'x'; 500];
+        let compressed = gzip_compress(&original);
+        let compressed_len = compressed.len().to_string();
+
+        let agent = Agent::new_with_defaults();
+        assert_eq!(agent.pool_count(), 0);
+
+        set_handler(
+            "/gz_pool",
+            200,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        let mut res = agent.get("https://example.test/gz_pool").call().unwrap();
+
+        // Read only a part of the decompressed body.
+        let mut reader = res.body_mut().as_reader();
+        let mut buf = [0u8; 10];
+        reader.read_exact(&mut buf).unwrap();
+        drop(reader);
+
+        // The connection is still held by the unread body.
+        assert_eq!(agent.pool_count(), 0);
+
+        // Reading to the end returns the connection to the pool.
+        let rest = res.body_mut().read_to_vec().unwrap();
+        assert_eq!(rest.len(), 490);
+        assert_eq!(agent.pool_count(), 1);
+    }
+
+    // A corrupt gzip trailer keeps surfacing as a decompression error when
+    // the read is split across readers; it must not turn into a normal end.
+    #[test]
+    fn gz_corrupt_trailer_split_read() {
+        init_test_log();
+
+        use std::io::Read;
+
+        let original = b"hello";
+        let mut compressed = gzip_compress(original);
+        let n = compressed.len();
+        compressed[n - 8] ^= 0xFF;
+        let compressed_len = compressed.len().to_string();
+
+        set_handler(
+            "/gz_corrupt_split",
+            200,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-length", &compressed_len),
+            ],
+            &compressed,
+        );
+
+        let mut res = crate::get("https://my.test/gz_corrupt_split")
+            .call()
+            .unwrap();
+
+        // The intact prefix is readable through one reader...
+        let mut prefix = [0u8; 5];
+        res.body_mut().as_reader().read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"hello");
+
+        // ...and the corrupt trailer errors in the next one.
+        let err = res.body_mut().read_to_vec().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Decompress("gzip", _)),
+            "expected decompression error, got: {:?}",
+            err
+        );
+    }
 }

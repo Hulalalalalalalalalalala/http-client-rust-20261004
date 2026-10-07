@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::{Arc, Mutex};
 
 use crate::Error;
 
@@ -11,20 +12,25 @@ use crate::Error;
 /// A body that is exactly `limit` bytes long and then ends normally is a
 /// successful read. Only when there is at least one more output byte does
 /// the reader fail with [`Error::BodyExceedsLimit`].
+///
+/// The limit counts only the bytes this reader delivers. However, once any
+/// reader of the same body confirms the body exceeds its limit, that outcome
+/// is shared (`exceeded`): every subsequent non-empty read — from any reader
+/// of the body — fails with the limit that was first confirmed exceeded.
 pub(crate) struct LimitReader<R> {
     reader: R,
     limit: u64,
     left: u64,
-    exceeded: bool,
+    exceeded: Arc<Mutex<Option<u64>>>,
 }
 
 impl<R> LimitReader<R> {
-    pub fn new(reader: R, limit: u64) -> Self {
+    pub fn new(reader: R, limit: u64, exceeded: Arc<Mutex<Option<u64>>>) -> Self {
         LimitReader {
             reader,
             limit,
             left: limit,
-            exceeded: false,
+            exceeded,
         }
     }
 }
@@ -40,9 +46,11 @@ impl<R: io::Read> io::Read for LimitReader<R> {
 
         // Once the limit is exceeded, keep reporting the error. The caller
         // must not receive further body bytes, nor see the exceeded body
-        // as a normal end-of-body.
-        if self.exceeded {
-            return Err(Error::BodyExceedsLimit(self.limit).into_io());
+        // as a normal end-of-body. This also covers readers created after
+        // another reader of the same body confirmed the limit was exceeded:
+        // they report the limit that was exceeded back then.
+        if let Some(limit) = *self.exceeded.lock().unwrap() {
+            return Err(Error::BodyExceedsLimit(limit).into_io());
         }
 
         if self.left == 0 {
@@ -63,7 +71,8 @@ impl<R: io::Read> io::Read for LimitReader<R> {
             }
 
             // There was at least one more output byte, the body is too big.
-            self.exceeded = true;
+            // Record it so later readers of this body report the same limit.
+            *self.exceeded.lock().unwrap() = Some(self.limit);
             return Err(Error::BodyExceedsLimit(self.limit).into_io());
         }
 

@@ -1,6 +1,7 @@
 use std::fmt;
 use std::io;
-use std::sync::Arc;
+use std::mem;
+use std::sync::{Arc, Mutex};
 
 pub use build::BodyBuilder;
 use ureq_proto::BodyMode;
@@ -8,7 +9,9 @@ use ureq_proto::http::header;
 
 use crate::Error;
 use crate::http;
+use crate::pool::Connection;
 use crate::run::BodyHandler;
+use crate::transport::time::Instant;
 
 use self::limit::LimitReader;
 use self::lossy::LossyUtf8Reader;
@@ -103,8 +106,92 @@ pub struct Body {
 }
 
 enum BodyDataSource {
+    /// The body as received, not yet wrapped in decoders.
+    Raw(RawSource),
+    /// The decoding chain, built on first use and shared by all readers
+    /// of this body.
+    Decoded(Box<DecodedBody>),
+}
+
+/// The body exactly as received (or as set via [`Body::builder`]).
+enum RawSource {
     Handler(Box<BodyHandler>),
     Reader(Box<dyn io::Read + Send + Sync>),
+}
+
+impl io::Read for RawSource {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            RawSource::Handler(v) => v.read(buf),
+            RawSource::Reader(v) => v.read(buf),
+        }
+    }
+}
+
+/// The decoded body: the raw source wrapped in content decoders (gzip,
+/// brotli) and charset conversion, plus state shared by all readers of
+/// the body.
+///
+/// The chain is built lazily on the first reader and then lives in the
+/// [`Body`] rather than in any individual reader. This is what allows a
+/// caller to read a prefix with one reader and continue with another:
+/// decompression state and any received-but-undelivered output stay
+/// here instead of being lost when a reader is dropped.
+pub(crate) struct DecodedBody {
+    chain: CharsetDecoder<ContentDecoder>,
+    state: Arc<Mutex<SharedState>>,
+}
+
+impl DecodedBody {
+    fn new(raw: RawSource, info: &ResponseInfo) -> Self {
+        // A handler-backed body shares its state with the handler, so the
+        // connection can be held in it once the raw body is fulfilled
+        // (see BodyHandler).
+        let state = match &raw {
+            RawSource::Handler(v) => v.shared(),
+            RawSource::Reader(_) => Arc::new(Mutex::new(SharedState::default())),
+        };
+
+        let chain = content_decoders(raw, info);
+        let chain = charset_decoder(chain, info);
+
+        DecodedBody { chain, state }
+    }
+}
+
+/// State shared between all readers of one body.
+#[derive(Default)]
+pub(crate) struct SharedState {
+    /// A read confirmed the body exceeds this limit. Sticky: subsequent
+    /// readers must keep reporting it rather than deliver more data.
+    pub(crate) exceeded_limit: Option<u64>,
+
+    /// A decompression failure. Terminal for the body: subsequent
+    /// readers must keep reporting it rather than see a normal end.
+    #[cfg(any(feature = "gzip", feature = "brotli"))]
+    pub(crate) decompress_failed: Option<&'static str>,
+
+    /// Connection held back from the pool until the decoded body is
+    /// fully delivered to the caller. Dropping it closes the connection.
+    pub(crate) held_connection: Option<HeldConnection>,
+}
+
+/// A connection whose raw body has been fully received, kept out of the
+/// pool until the decoded output is fully delivered to the caller.
+pub(crate) struct HeldConnection {
+    connection: Connection,
+    now: Instant,
+}
+
+impl HeldConnection {
+    pub(crate) fn new(connection: Connection, now: Instant) -> Self {
+        HeldConnection { connection, now }
+    }
+
+    /// Return the connection to the pool.
+    pub(crate) fn release(self) {
+        self.connection.reuse(self.now);
+    }
 }
 
 #[derive(Clone)]
@@ -126,9 +213,28 @@ impl Body {
 
     pub(crate) fn new(handler: BodyHandler, info: ResponseInfo) -> Self {
         Body {
-            source: BodyDataSource::Handler(Box::new(handler)),
+            source: BodyDataSource::Raw(RawSource::Handler(Box::new(handler))),
             info: Arc::new(info),
         }
+    }
+
+    /// Wrap the raw source in the decoding chain, if not done already.
+    ///
+    /// The chain is built once and then shared by every reader created
+    /// from this body, so reading can continue where a previous reader
+    /// stopped.
+    fn ensure_decoded(&mut self) {
+        if matches!(self.source, BodyDataSource::Decoded(_)) {
+            return;
+        }
+
+        let placeholder = BodyDataSource::Raw(RawSource::Reader(Box::new(io::empty())));
+        let source = mem::replace(&mut self.source, placeholder);
+        let BodyDataSource::Raw(raw) = source else {
+            unreachable!("checked to be raw above")
+        };
+
+        self.source = BodyDataSource::Decoded(Box::new(DecodedBody::new(raw, &self.info)));
     }
 
     /// The mime-type of the `content-type` header.
@@ -419,7 +525,11 @@ impl Body {
     /// # Ok::<_, ureq::Error>(())
     /// ```
     pub fn with_config(&mut self) -> BodyWithConfig {
-        let handler = (&mut self.source).into();
+        self.ensure_decoded();
+        let BodyDataSource::Decoded(decoded) = &mut self.source else {
+            unreachable!("ensure_decoded makes the source decoded")
+        };
+        let handler = BodySourceRef::Shared(&mut decoded.chain, decoded.state.clone());
         BodyWithConfig::new(handler, self.info.clone())
     }
 
@@ -449,8 +559,13 @@ impl Body {
     /// limit such as 128MB. The exact number will vary by your client's download
     /// needs, available system resources, and system utilization.
     pub fn into_with_config(self) -> BodyWithConfig<'static> {
-        let handler = self.source.into();
-        BodyWithConfig::new(handler, self.info)
+        let Body { source, info } = self;
+        let decoded = match source {
+            BodyDataSource::Decoded(v) => v,
+            BodyDataSource::Raw(raw) => Box::new(DecodedBody::new(raw, &info)),
+        };
+        let handler = BodySourceRef::Owned(decoded.chain, decoded.state);
+        BodyWithConfig::new(handler, info)
     }
 }
 
@@ -524,13 +639,7 @@ impl<'a> BodyWithConfig<'a> {
     }
 
     fn do_build(self) -> BodyReader<'a> {
-        BodyReader::new(
-            self.handler,
-            self.limit,
-            &self.info,
-            self.info.body_mode,
-            self.lossy_utf8,
-        )
+        BodyReader::new(self.handler, self.limit, &self.info, self.lossy_utf8)
     }
 
     /// Creates a reader.
@@ -781,6 +890,28 @@ impl ResponseInfo {
             .map(|s| s.starts_with("text/"))
             .unwrap_or(false)
     }
+
+    /// The body mode to declare when a reader of this body is reused as
+    /// a request send body.
+    ///
+    /// Decompression and charset conversion change the number of bytes
+    /// in unknown ways, so a transformed body must be sent chunked.
+    fn outgoing_body_mode(&self) -> BodyMode {
+        let mut mode = self.body_mode;
+
+        if self.is_decompressing() {
+            // The decompressed size is not known up front.
+            mode = BodyMode::Chunked;
+        }
+
+        #[cfg(feature = "charset")]
+        if charset_encoding(self).is_some() {
+            // Charset conversion changes the size.
+            mode = BodyMode::Chunked;
+        }
+
+        mode
+    }
 }
 
 fn split_content_type(content_type: &str) -> (Option<String>, Option<String>) {
@@ -852,27 +983,27 @@ fn split_content_type(content_type: &str) -> (Option<String>, Option<String>) {
 pub struct BodyReader<'a> {
     // The limit is outermost, so it counts the final output bytes: after
     // decompression, charset conversion and lossy utf-8 replacement.
-    reader: LimitReader<MaybeLossyDecoder<CharsetDecoder<ContentDecoder<'a>>>>,
+    reader: LimitReader<MaybeLossyDecoder<DecodedRef<'a>>>,
     // If this reader is used as SendBody for another request, this
     // body mode can indiciate the content-length. Gzip, charset etc
     // would mean input is not same as output.
     outgoing_body_mode: BodyMode,
 }
 
-/// The content-decoding stage of the body reader.
+/// The content-decoding stage of the decoded body chain.
 ///
 /// A response can carry a sequence of content-codings (`Content-Encoding:
 /// gzip, br`), so the decoders nest recursively: each layer decodes the
 /// output of the previous one.
-enum ContentDecoder<'a> {
-    Source(BodySourceRef<'a>),
+enum ContentDecoder {
+    Source(RawSource),
     #[cfg(feature = "gzip")]
-    Gzip(Box<gzip::GzipDecoder<ContentDecoder<'a>>>),
+    Gzip(Box<gzip::GzipDecoder<ContentDecoder>>),
     #[cfg(feature = "brotli")]
-    Brotli(Box<brotli::BrotliDecoder<ContentDecoder<'a>>>),
+    Brotli(Box<brotli::BrotliDecoder<ContentDecoder>>),
 }
 
-impl<'a> io::Read for ContentDecoder<'a> {
+impl io::Read for ContentDecoder {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             ContentDecoder::Source(v) => v.read(buf),
@@ -886,39 +1017,35 @@ impl<'a> io::Read for ContentDecoder<'a> {
 
 impl<'a> BodyReader<'a> {
     fn new(
-        reader: BodySourceRef<'a>,
+        source: BodySourceRef<'a>,
         limit: u64,
         info: &ResponseInfo,
-        incoming_body_mode: BodyMode,
         lossy_utf8: bool,
     ) -> BodyReader<'a> {
         // This is outgoing body_mode in case we are using the BodyReader as a send body
         // in a proxy situation.
-        let mut outgoing_body_mode = incoming_body_mode;
+        let outgoing_body_mode = info.outgoing_body_mode();
 
-        let reader = content_decoders(reader, info, &mut outgoing_body_mode);
+        let (chain, state) = match source {
+            BodySourceRef::Shared(chain, state) => (ChainRef::Shared(chain), state),
+            BodySourceRef::Owned(chain, state) => (ChainRef::Owned(chain), state),
+        };
 
-        let reader = if info.is_text() {
-            charset_decoder(
-                reader,
-                info.mime_type.as_deref(),
-                info.charset.as_deref(),
-                &mut outgoing_body_mode,
-            )
-        } else {
-            CharsetDecoder::PassThrough(reader)
+        let decoded = DecodedRef {
+            chain,
+            state: state.clone(),
         };
 
         let reader = if info.is_text() && lossy_utf8 {
-            MaybeLossyDecoder::Lossy(LossyUtf8Reader::new(reader))
+            MaybeLossyDecoder::Lossy(LossyUtf8Reader::new(decoded))
         } else {
-            MaybeLossyDecoder::PassThrough(reader)
+            MaybeLossyDecoder::PassThrough(decoded)
         };
 
         // The size limit applies to the output bytes the caller receives,
         // i.e. after decompression, charset conversion and lossy utf-8
         // replacement. A body that ends exactly at the limit is not an error.
-        let reader = LimitReader::new(reader, limit);
+        let reader = LimitReader::new(reader, limit, state);
 
         BodyReader {
             outgoing_body_mode,
@@ -931,7 +1058,7 @@ impl<'a> BodyReader<'a> {
     }
 }
 
-/// Wrap the reader in one decoder per content-coding.
+/// Wrap the raw source in one decoder per content-coding.
 ///
 /// The server applied the codings in the order they are listed, so
 /// decoding happens in reverse: the last listed coding is the outermost
@@ -940,20 +1067,12 @@ impl<'a> BodyReader<'a> {
 /// The chain is only built when [`ResponseInfo::is_decompressing`], i.e.
 /// every coding in the sequence is supported by the enabled features.
 /// Otherwise the body passes through untouched.
-fn content_decoders<'a>(
-    reader: BodySourceRef<'a>,
-    info: &ResponseInfo,
-    outgoing_body_mode: &mut BodyMode,
-) -> ContentDecoder<'a> {
+fn content_decoders(raw: RawSource, info: &ResponseInfo) -> ContentDecoder {
+    let mut reader = ContentDecoder::Source(raw);
+
     if !info.is_decompressing() {
-        return ContentDecoder::Source(reader);
+        return reader;
     }
-
-    // The decompressed size is not known up front, so a body reused as a
-    // send body must be chunked.
-    *outgoing_body_mode = BodyMode::Chunked;
-
-    let mut reader = ContentDecoder::Source(reader);
 
     for encoding in info.content_encodings.iter().rev() {
         reader = match encoding {
@@ -977,35 +1096,40 @@ fn content_decoders<'a>(
     reader
 }
 
+/// The charset the body is converted from, if charset decoding applies.
+///
+/// This needs two components: a mime-type starting `text/` and a
+/// non-utf8 charset indication.
+#[cfg(feature = "charset")]
+fn charset_encoding(info: &ResponseInfo) -> Option<&'static encoding_rs::Encoding> {
+    use encoding_rs::{Encoding, UTF_8};
+
+    if !info.is_text() {
+        return None;
+    }
+
+    let from = info
+        .charset
+        .as_deref()
+        .and_then(|c| Encoding::for_label(c.as_bytes()))
+        .unwrap_or(UTF_8);
+
+    (from != UTF_8).then_some(from)
+}
+
 #[allow(unused)]
-fn charset_decoder<R: io::Read>(
-    reader: R,
-    mime_type: Option<&str>,
-    charset: Option<&str>,
-    body_mode: &mut BodyMode,
-) -> CharsetDecoder<R> {
+fn charset_decoder(reader: ContentDecoder, info: &ResponseInfo) -> CharsetDecoder<ContentDecoder> {
     #[cfg(feature = "charset")]
-    {
-        use encoding_rs::{Encoding, UTF_8};
-
-        let from = charset
-            .and_then(|c| Encoding::for_label(c.as_bytes()))
-            .unwrap_or(UTF_8);
-
-        if from == UTF_8 {
-            // Do nothing
-            CharsetDecoder::PassThrough(reader)
-        } else {
-            debug!("Decoding charset {}", from.name());
-            *body_mode = BodyMode::Chunked;
-            CharsetDecoder::Decoder(self::charset::CharCodec::new(reader, from, UTF_8))
-        }
+    if let Some(from) = charset_encoding(info) {
+        debug!("Decoding charset {}", from.name());
+        return CharsetDecoder::Decoder(self::charset::CharCodec::new(
+            reader,
+            from,
+            encoding_rs::UTF_8,
+        ));
     }
 
-    #[cfg(not(feature = "charset"))]
-    {
-        CharsetDecoder::PassThrough(reader)
-    }
+    CharsetDecoder::PassThrough(reader)
 }
 
 enum MaybeLossyDecoder<R> {
@@ -1050,39 +1174,91 @@ impl fmt::Debug for Body {
     }
 }
 
-impl<'a> From<&'a mut BodyDataSource> for BodySourceRef<'a> {
-    fn from(value: &'a mut BodyDataSource) -> Self {
-        match value {
-            BodyDataSource::Handler(v) => Self::HandlerShared(v),
-            BodyDataSource::Reader(v) => Self::ReaderShared(v),
+/// A reference to the decoded body chain, either borrowed (via
+/// [`Body::with_config`]) or owned (via [`Body::into_with_config`]).
+enum BodySourceRef<'a> {
+    Shared(
+        &'a mut CharsetDecoder<ContentDecoder>,
+        Arc<Mutex<SharedState>>,
+    ),
+    Owned(CharsetDecoder<ContentDecoder>, Arc<Mutex<SharedState>>),
+}
+
+/// Per-reader handle on the shared decoded body chain.
+///
+/// All readers of one body read from the same chain, so reading
+/// continues where the previous reader stopped. Terminal conditions
+/// (decompression failure, end of body) are handled here so they behave
+/// the same no matter which reader observes them first.
+struct DecodedRef<'a> {
+    chain: ChainRef<'a>,
+    state: Arc<Mutex<SharedState>>,
+}
+
+enum ChainRef<'a> {
+    Shared(&'a mut CharsetDecoder<ContentDecoder>),
+    Owned(CharsetDecoder<ContentDecoder>),
+}
+
+impl<'a> DecodedRef<'a> {
+    /// Return a held connection to the pool, if there is one.
+    fn release_connection(&self) {
+        let held = self.state.lock().unwrap().held_connection.take();
+        if let Some(held) = held {
+            held.release();
         }
     }
 }
 
-impl From<BodyDataSource> for BodySourceRef<'static> {
-    fn from(value: BodyDataSource) -> Self {
-        match value {
-            BodyDataSource::Handler(v) => Self::HandlerOwned(v),
-            BodyDataSource::Reader(v) => Self::ReaderOwned(v),
-        }
-    }
-}
-
-pub(crate) enum BodySourceRef<'a> {
-    HandlerShared(&'a mut BodyHandler),
-    HandlerOwned(Box<BodyHandler>),
-    ReaderShared(&'a mut (dyn io::Read + Send + Sync)),
-    ReaderOwned(Box<dyn io::Read + Send + Sync>),
-}
-
-impl<'a> io::Read for BodySourceRef<'a> {
+impl<'a> io::Read for DecodedRef<'a> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            BodySourceRef::HandlerShared(v) => v.read(buf),
-            BodySourceRef::HandlerOwned(v) => v.read(buf),
-            BodySourceRef::ReaderShared(v) => v.read(buf),
-            BodySourceRef::ReaderOwned(v) => v.read(buf),
+        // Reading into an empty buffer is always a no-op. It must not
+        // touch the chain or be mistaken for end-of-body.
+        if buf.is_empty() {
+            return Ok(0);
         }
+
+        // A decompression failure is terminal for the whole body. Every
+        // subsequent reader must see the same failure, not a normal end.
+        #[cfg(any(feature = "gzip", feature = "brotli"))]
+        if let Some(encoding) = self.state.lock().unwrap().decompress_failed {
+            return Err(
+                Error::Decompress(encoding, io::Error::other("decompression failed")).into_io(),
+            );
+        }
+
+        let chain = match &mut self.chain {
+            ChainRef::Shared(v) => &mut **v,
+            ChainRef::Owned(v) => v,
+        };
+
+        match chain.read(buf) {
+            Ok(0) => {
+                // The decoded body is fully delivered. A connection held
+                // back from the pool can be reused now.
+                self.release_connection();
+                Ok(0)
+            }
+            Err(e) => {
+                // A decompression failure stays in effect for the rest
+                // of this body.
+                #[cfg(any(feature = "gzip", feature = "brotli"))]
+                if let Some(encoding) = decompress_encoding(&e) {
+                    self.state.lock().unwrap().decompress_failed = Some(encoding);
+                }
+                Err(e)
+            }
+            ok => ok,
+        }
+    }
+}
+
+/// The content-coding of a decompression failure, if the error is one.
+#[cfg(any(feature = "gzip", feature = "brotli"))]
+fn decompress_encoding(e: &io::Error) -> Option<&'static str> {
+    match e.get_ref()?.downcast_ref::<Error>() {
+        Some(Error::Decompress(encoding, _)) => Some(*encoding),
+        _ => None,
     }
 }
 
@@ -1177,7 +1353,10 @@ mod test {
         set_handler(
             "/json",
             200,
-            &[("content-length", &len), ("content-type", "application/json")],
+            &[
+                ("content-length", &len),
+                ("content-type", "application/json"),
+            ],
             json,
         );
 
@@ -1204,7 +1383,10 @@ mod test {
         set_handler(
             "/json_len",
             200,
-            &[("content-length", &len), ("content-type", "application/json")],
+            &[
+                ("content-length", &len),
+                ("content-type", "application/json"),
+            ],
             json,
         );
         let mut res = crate::get("https://my.test/json_len").call().unwrap();

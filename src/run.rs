@@ -1,4 +1,4 @@
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::{io, mem};
 
 use http::uri::Scheme;
@@ -9,7 +9,7 @@ use ureq_proto::client::state::{Prepare, SendBody as SendBodyState};
 use ureq_proto::client::{Await100Result, RecvBodyResult};
 use ureq_proto::client::{RecvResponseResult, SendRequestResult};
 
-use crate::body::ResponseInfo;
+use crate::body::{HeldConnection, ResponseInfo, SharedState};
 use crate::config::{Config, DEFAULT_USER_AGENT, RedirectAuthHeaders, RequestLevelConfig};
 use crate::http;
 use crate::pool::Connection;
@@ -294,9 +294,8 @@ fn call_run(
 
     let (mut response, response_result) = result.map_err(|failure| {
         // The broken connection is discarded by dropping it here.
-        let retryable = from_pool
-            && !received_response
-            && matches!(failure, PhaseFailure::Disconnect(_));
+        let retryable =
+            from_pool && !received_response && matches!(failure, PhaseFailure::Disconnect(_));
         CallFailure {
             error: failure.into_error(),
             retryable,
@@ -960,9 +959,26 @@ pub(crate) struct BodyHandler {
     timings: CallTimings,
     remote_closed: bool,
     redirect: Option<Box<Call<Redirect>>>,
+    /// State shared with the decoded body chain built over this handler.
+    /// When the raw body is fulfilled, the connection is held here (not
+    /// returned to the pool) until the decoded output is fully delivered
+    /// to the caller.
+    shared: Arc<Mutex<SharedState>>,
 }
 
 impl BodyHandler {
+    /// The state shared with readers of the body built over this handler.
+    pub(crate) fn shared(&self) -> Arc<Mutex<SharedState>> {
+        self.shared.clone()
+    }
+
+    /// Return a held connection to the pool, if there is one.
+    fn release_connection(&mut self) {
+        let held = self.shared.lock().unwrap().held_connection.take();
+        if let Some(held) = held {
+            held.release();
+        }
+    }
     fn do_read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         let (Some(call), Some(connection), timings) =
             (&mut self.call, &mut self.connection, &mut self.timings)
@@ -1082,7 +1098,19 @@ impl BodyHandler {
             };
 
         let connection = self.connection.take().expect("ended() called with body");
-        cleanup(connection, must_close_connection, self.timings.now());
+
+        if must_close_connection {
+            connection.close();
+        } else {
+            // The raw body is fully received, but there might still be
+            // decompressed output that has not been delivered to the
+            // caller. Hold the connection back from the pool until the
+            // decoded body is read to end (see DecodedRef). Dropping the
+            // body before that closes the connection.
+            let now = self.timings.now();
+            self.shared.lock().unwrap().held_connection =
+                Some(HeldConnection::new(connection, now));
+        }
 
         Ok(())
     }
@@ -1095,6 +1123,10 @@ impl BodyHandler {
                 break;
             }
         }
+
+        // The redirect body is read raw (no decoding), so reaching the end
+        // here means the connection can go back to the pool right away.
+        self.release_connection();
 
         // Unwrap is OK, because we are only consuming the redirect body if
         // such a body was signalled by the remote.

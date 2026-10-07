@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use ureq_proto::BodyMode;
 
-use super::{Body, BodyDataSource, ResponseInfo};
+use super::{Body, BodyDataSource, RawSource, ResponseInfo};
 
 /// Builder for creating a response body.
 ///
@@ -121,7 +121,7 @@ impl BodyBuilder {
     /// reaches the end.
     pub fn reader(self, data: impl io::Read + Send + Sync + 'static) -> Body {
         Body {
-            source: BodyDataSource::Reader(Box::new(data)),
+            source: BodyDataSource::Raw(RawSource::Reader(Box::new(data))),
             info: Arc::new(self.info),
         }
     }
